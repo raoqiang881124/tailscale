@@ -68,6 +68,14 @@ main() {
 				if [ -z "${VERSION_ID:-}" ]; then
 					# rolling release. If you haven't kept current, that's on you.
 					APT_KEY_TYPE="keyring"
+				# Parrot Security is a special case that uses ID=debian
+				elif [ "$NAME" = "Parrot Security" ]; then
+					# All versions new enough to have this behaviour prefer keyring
+					# and their VERSION_ID is not consistent with Debian.
+					APT_KEY_TYPE="keyring"
+					# They don't specify the Debian version they're based off in os-release
+					# but Parrot 6 is based on Debian 12 Bookworm.
+					VERSION=bookworm
 				elif [ "$VERSION_ID" -lt 11 ]; then
 					APT_KEY_TYPE="legacy"
 				else
@@ -154,7 +162,7 @@ main() {
 					APT_KEY_TYPE="keyring"
 				fi
 				;;
-			Deepin)  # https://github.com/tailscale/tailscale/issues/7862
+			Deepin|deepin)  # https://github.com/tailscale/tailscale/issues/7862
 				OS="debian"
 				PACKAGETYPE="apt"
 				if [ "$VERSION_ID" -lt 20 ]; then
@@ -163,6 +171,19 @@ main() {
 				else
 					APT_KEY_TYPE="keyring"
 					VERSION="bullseye"
+				fi
+				;;
+			pika)
+				PACKAGETYPE="apt"
+				# All versions of PikaOS are new enough to prefer keyring
+				APT_KEY_TYPE="keyring"
+				# Older versions of PikaOS are based on Ubuntu rather than Debian
+				if [ "$VERSION_ID" -lt 4 ]; then
+					OS="ubuntu"
+					VERSION="$UBUNTU_CODENAME"
+				else
+					OS="debian"
+					VERSION="$DEBIAN_CODENAME"
 				fi
 				;;
 			centos)
@@ -224,7 +245,7 @@ main() {
 				VERSION="leap/15.4"
 				PACKAGETYPE="zypper"
 				;;
-			arch|archarm|endeavouros|blendos|garuda)
+			arch|archarm|endeavouros|blendos|garuda|archcraft|cachyos)
 				OS="arch"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
@@ -488,9 +509,41 @@ main() {
 			set +x
 		;;
 		dnf)
+			# DNF 5 has a different argument format; determine which one we have.
+			DNF_VERSION="3"
+			if dnf --version | grep -q '^dnf5 version'; then
+				DNF_VERSION="5"
+			fi
+
+			# The 'config-manager' plugin wasn't implemented when
+			# DNF5 was released; detect that and use the old
+			# version if necessary.
+			if [ "$DNF_VERSION" = "5" ]; then
+				set -x
+				$SUDO dnf install -y 'dnf-command(config-manager)' && DNF_HAVE_CONFIG_MANAGER=1 || DNF_HAVE_CONFIG_MANAGER=0
+				set +x
+
+				if [ "$DNF_HAVE_CONFIG_MANAGER" != "1" ]; then
+					if type dnf-3 >/dev/null; then
+						DNF_VERSION="3"
+					else
+						echo "dnf 5 detected, but 'dnf-command(config-manager)' not available and dnf-3 not found"
+						exit 1
+					fi
+				fi
+			fi
+
 			set -x
-			$SUDO dnf install -y 'dnf-command(config-manager)'
-			$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			if [ "$DNF_VERSION" = "3" ]; then
+				$SUDO dnf install -y 'dnf-command(config-manager)'
+				$SUDO dnf config-manager --add-repo "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			elif [ "$DNF_VERSION" = "5" ]; then
+				# Already installed config-manager, above.
+				$SUDO dnf config-manager addrepo --from-repofile="https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
+			else
+				echo "unexpected: unknown dnf version $DNF_VERSION"
+				exit 1
+			fi
 			$SUDO dnf install -y tailscale
 			$SUDO systemctl enable --now tailscaled
 			set +x
@@ -504,6 +557,7 @@ main() {
 		;;
 		zypper)
 			set -x
+			$SUDO rpm --import "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/repo.gpg"
 			$SUDO zypper --non-interactive ar -g -r "https://pkgs.tailscale.com/$TRACK/$OS/$VERSION/tailscale.repo"
 			$SUDO zypper --non-interactive --gpg-auto-import-keys refresh
 			$SUDO zypper --non-interactive install tailscale
@@ -512,7 +566,6 @@ main() {
 			;;
 		pacman)
 			set -x
-			$SUDO pacman -Sy
 			$SUDO pacman -S tailscale --noconfirm
 			$SUDO systemctl enable --now tailscaled
 			set +x
@@ -526,6 +579,14 @@ main() {
 			;;
 		apk)
 			set -x
+			if ! grep -Eq '^http.*/community$' /etc/apk/repositories; then
+				if type setup-apkrepos >/dev/null; then
+					$SUDO setup-apkrepos -c -1
+				else
+					echo "installing tailscale requires the community repo to be enabled in /etc/apk/repositories"
+					exit 1
+				fi
+			fi
 			$SUDO apk add tailscale
 			$SUDO rc-update add tailscale
 			$SUDO rc-service tailscale start

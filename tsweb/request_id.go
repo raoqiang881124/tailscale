@@ -6,9 +6,10 @@ package tsweb
 import (
 	"context"
 	"net/http"
+	"time"
 
-	"github.com/google/uuid"
 	"tailscale.com/util/ctxkey"
+	"tailscale.com/util/rands"
 )
 
 // RequestID is an opaque identifier for a HTTP request, used to correlate
@@ -25,6 +26,12 @@ import (
 // opaque string. The current implementation uses a UUID.
 type RequestID string
 
+// String returns the string format of the request ID, for use in e.g. setting
+// a [http.Header].
+func (r RequestID) String() string {
+	return string(r)
+}
+
 // RequestIDKey stores and loads [RequestID] values within a [context.Context].
 var RequestIDKey ctxkey.Key[RequestID]
 
@@ -35,10 +42,12 @@ const RequestIDHeader = "X-Tailscale-Request-Id"
 
 // GenerateRequestID generates a new request ID with the current format.
 func GenerateRequestID() RequestID {
-	// REQ-1 indicates the version of the RequestID pattern. It is
-	// currently arbitrary but allows for forward compatible
-	// transitions if needed.
-	return RequestID("REQ-1" + uuid.NewString())
+	// Return a string of the form "REQ-<VersionByte><...>"
+	// Previously we returned "REQ-1<UUIDString>".
+	// Now we return "REQ-2" version, where the "2" doubles as the year 2YYY
+	// in a leading date.
+	now := time.Now().UTC()
+	return RequestID("REQ-" + now.Format("20060102150405") + rands.HexString(16))
 }
 
 // SetRequestID is an HTTP middleware that injects a RequestID in the

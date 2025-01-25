@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/http2"
 	"tailscale.com/ipn"
@@ -52,8 +54,19 @@ var ErrETagMismatch = errors.New("etag mismatch")
 var serveHTTPContextKey ctxkey.Key[*serveHTTPContext]
 
 type serveHTTPContext struct {
-	SrcAddr  netip.AddrPort
-	DestPort uint16
+	SrcAddr       netip.AddrPort
+	ForVIPService tailcfg.ServiceName // "" means local
+	DestPort      uint16
+
+	// provides funnel-specific context, nil if not funneled
+	Funnel *funnelFlow
+}
+
+// funnelFlow represents a funneled connection initiated via IngressPeer
+// to Host.
+type funnelFlow struct {
+	Host        string
+	IngressPeer tailcfg.NodeView
 }
 
 // localListener is the state of host-level net.Listen for a specific (Tailscale IP, port)
@@ -62,7 +75,7 @@ type serveHTTPContext struct {
 //
 // This is not used in userspace-networking mode.
 //
-// localListener is used by tailscale serve (TCP only), the built-in web client and tailfs.
+// localListener is used by tailscale serve (TCP only), the built-in web client and Taildrive.
 // Most serve traffic and peer traffic for the web client are intercepted by netstack.
 // This listener exists purely for connections from the machine itself, as that goes via the kernel,
 // so we need to be in the kernel's listening/routing tables.
@@ -89,7 +102,7 @@ func (b *LocalBackend) newServeListener(ctx context.Context, ap netip.AddrPort, 
 
 		handler: func(conn net.Conn) error {
 			srcAddr := conn.RemoteAddr().(*net.TCPAddr).AddrPort()
-			handler := b.tcpHandlerForServe(ap.Port(), srcAddr)
+			handler := b.tcpHandlerForServe(ap.Port(), srcAddr, nil)
 			if handler == nil {
 				b.logf("[unexpected] local-serve: no handler for %v to port %v", srcAddr, ap.Port())
 				conn.Close()
@@ -146,6 +159,14 @@ func (s *localListener) Run() {
 		tcp4or6 := "tcp4"
 		if ip.Is6() {
 			tcp4or6 = "tcp6"
+		}
+
+		// while we were backing off and trying again, the context got canceled
+		// so don't bind, just return, because otherwise there will be no way
+		// to close this listener
+		if s.ctx.Err() != nil {
+			s.logf("localListener context closed before binding")
+			return
 		}
 
 		ln, err := lc.Listen(s.ctx, tcp4or6, net.JoinHostPort(ipStr, fmt.Sprint(s.ap.Port())))
@@ -222,8 +243,7 @@ func (b *LocalBackend) updateServeTCPPortNetMapAddrListenersLocked(ports []uint1
 	}
 
 	addrs := nm.GetAddresses()
-	for i := range addrs.Len() {
-		a := addrs.At(i)
+	for _, a := range addrs.All() {
 		for _, p := range ports {
 			addrPort := netip.AddrPortFrom(a.Addr(), p)
 			if _, ok := b.serveListeners[addrPort]; ok {
@@ -254,6 +274,12 @@ func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string
 	}
 	if b.isConfigLocked_Locked() {
 		return errors.New("can't reconfigure tailscaled when using a config file; config file is locked")
+	}
+
+	if config != nil {
+		if err := config.CheckValidServicesConfig(); err != nil {
+			return err
+		}
 	}
 
 	nm := b.netMap
@@ -305,18 +331,17 @@ func (b *LocalBackend) setServeConfigLocked(config *ipn.ServeConfig, etag string
 	if prevConfig.Valid() {
 		has := func(string) bool { return false }
 		if b.serveConfig.Valid() {
-			has = b.serveConfig.Foreground().Has
+			has = b.serveConfig.Foreground().Contains
 		}
-		prevConfig.Foreground().Range(func(k string, v ipn.ServeConfigView) (cont bool) {
+		for k := range prevConfig.Foreground().All() {
 			if !has(k) {
 				for _, sess := range b.notifyWatchers {
 					if sess.sessionID == k {
-						close(sess.ch)
+						sess.cancel()
 					}
 				}
 			}
-			return true
-		})
+		}
 	}
 
 	return nil
@@ -336,7 +361,7 @@ func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
 func (b *LocalBackend) DeleteForegroundSession(sessionID string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.serveConfig.Valid() || !b.serveConfig.Foreground().Has(sessionID) {
+	if !b.serveConfig.Valid() || !b.serveConfig.Foreground().Contains(sessionID) {
 		return nil
 	}
 	sc := b.serveConfig.AsStruct()
@@ -372,7 +397,7 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target
 		return
 	}
 
-	_, port, err := net.SplitHostPort(string(target))
+	host, port, err := net.SplitHostPort(string(target))
 	if err != nil {
 		logf("got ingress conn for bad target %q; rejecting", target)
 		sendRST()
@@ -397,9 +422,10 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target
 			return
 		}
 	}
-	// TODO(bradfitz): pass ingressPeer etc in context to tcpHandlerForServe,
-	// extend serveHTTPContext or similar.
-	handler := b.tcpHandlerForServe(dport, srcAddr)
+	handler := b.tcpHandlerForServe(dport, srcAddr, &funnelFlow{
+		Host:        host,
+		IngressPeer: ingressPeer,
+	})
 	if handler == nil {
 		logf("[unexpected] no matching ingress serve handler for %v to port %v", srcAddr, dport)
 		sendRST()
@@ -413,9 +439,109 @@ func (b *LocalBackend) HandleIngressTCPConn(ingressPeer tailcfg.NodeView, target
 	handler(c)
 }
 
+// tcpHandlerForVIPService returns a handler for a TCP connection to a VIP service
+// that is being served via the ipn.ServeConfig. It returns nil if the destination
+// address is not a VIP service or if the VIP service does not have a TCP handler set.
+func (b *LocalBackend) tcpHandlerForVIPService(dstAddr, srcAddr netip.AddrPort) (handler func(net.Conn) error) {
+	b.mu.Lock()
+	sc := b.serveConfig
+	ipVIPServiceMap := b.ipVIPServiceMap
+	b.mu.Unlock()
+
+	if !sc.Valid() {
+		return nil
+	}
+
+	dport := dstAddr.Port()
+
+	dstSvc, ok := ipVIPServiceMap[dstAddr.Addr()]
+	if !ok {
+		return nil
+	}
+
+	tcph, ok := sc.FindServiceTCP(dstSvc, dstAddr.Port())
+	if !ok {
+		b.logf("The destination service doesn't have a TCP handler set.")
+		return nil
+	}
+
+	if tcph.HTTPS() || tcph.HTTP() {
+		hs := &http.Server{
+			Handler: http.HandlerFunc(b.serveWebHandler),
+			BaseContext: func(_ net.Listener) context.Context {
+				return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
+					SrcAddr:       srcAddr,
+					ForVIPService: dstSvc,
+					DestPort:      dport,
+				})
+			},
+		}
+		if tcph.HTTPS() {
+			// TODO(kevinliang10): just leaving this TLS cert creation as if we don't have other
+			// hostnames, but for services this getTLSServeCetForPort will need a version that also take
+			// in the hostname. How to store the TLS cert is still being discussed.
+			hs.TLSConfig = &tls.Config{
+				GetCertificate: b.getTLSServeCertForPort(dport, dstSvc),
+			}
+			return func(c net.Conn) error {
+				return hs.ServeTLS(netutil.NewOneConnListener(c, nil), "", "")
+			}
+		}
+
+		return func(c net.Conn) error {
+			return hs.Serve(netutil.NewOneConnListener(c, nil))
+		}
+	}
+
+	if backDst := tcph.TCPForward(); backDst != "" {
+		return func(conn net.Conn) error {
+			defer conn.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			backConn, err := b.dialer.SystemDial(ctx, "tcp", backDst)
+			cancel()
+			if err != nil {
+				b.logf("localbackend: failed to TCP proxy port %v (from %v) to %s: %v", dport, srcAddr, backDst, err)
+				return nil
+			}
+			defer backConn.Close()
+			if sni := tcph.TerminateTLS(); sni != "" {
+				conn = tls.Server(conn, &tls.Config{
+					GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+						defer cancel()
+						pair, err := b.GetCertPEM(ctx, sni)
+						if err != nil {
+							return nil, err
+						}
+						cert, err := tls.X509KeyPair(pair.CertPEM, pair.KeyPEM)
+						if err != nil {
+							return nil, err
+						}
+						return &cert, nil
+					},
+				})
+			}
+
+			errc := make(chan error, 1)
+			go func() {
+				_, err := io.Copy(backConn, conn)
+				errc <- err
+			}()
+			go func() {
+				_, err := io.Copy(conn, backConn)
+				errc <- err
+			}()
+			return <-errc
+		}
+	}
+
+	return nil
+}
+
 // tcpHandlerForServe returns a handler for a TCP connection to be served via
-// the ipn.ServeConfig.
-func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) (handler func(net.Conn) error) {
+// the ipn.ServeConfig. The funnelFlow can be nil if this is not a funneled
+// connection.
+func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort, f *funnelFlow) (handler func(net.Conn) error) {
 	b.mu.Lock()
 	sc := b.serveConfig
 	b.mu.Unlock()
@@ -434,6 +560,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 			Handler: http.HandlerFunc(b.serveWebHandler),
 			BaseContext: func(_ net.Listener) context.Context {
 				return serveHTTPContextKey.WithValue(context.Background(), &serveHTTPContext{
+					Funnel:   f,
 					SrcAddr:  srcAddr,
 					DestPort: dport,
 				})
@@ -441,7 +568,7 @@ func (b *LocalBackend) tcpHandlerForServe(dport uint16, srcAddr netip.AddrPort) 
 		}
 		if tcph.HTTPS() {
 			hs.TLSConfig = &tls.Config{
-				GetCertificate: b.getTLSServeCertForPort(dport),
+				GetCertificate: b.getTLSServeCertForPort(dport, ""),
 			}
 			return func(c net.Conn) error {
 				return hs.ServeTLS(netutil.NewOneConnListener(c, nil), "", "")
@@ -521,7 +648,7 @@ func (b *LocalBackend) getServeHandler(r *http.Request) (_ ipn.HTTPHandlerView, 
 		b.logf("[unexpected] localbackend: no serveHTTPContext in request")
 		return z, "", false
 	}
-	wsc, ok := b.webServerConfig(hostname, sctx.DestPort)
+	wsc, ok := b.webServerConfig(hostname, sctx.ForVIPService, sctx.DestPort)
 	if !ok {
 		return z, "", false
 	}
@@ -702,25 +829,45 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	r.Out.Header.Del("Tailscale-User-Login")
 	r.Out.Header.Del("Tailscale-User-Name")
 	r.Out.Header.Del("Tailscale-User-Profile-Pic")
+	r.Out.Header.Del("Tailscale-Funnel-Request")
 	r.Out.Header.Del("Tailscale-Headers-Info")
 
 	c, ok := serveHTTPContextKey.ValueOk(r.Out.Context())
 	if !ok {
 		return
 	}
-	node, user, ok := b.WhoIs(c.SrcAddr)
+	if c.Funnel != nil {
+		r.Out.Header.Set("Tailscale-Funnel-Request", "?1")
+		return
+	}
+	node, user, ok := b.WhoIs("tcp", c.SrcAddr)
 	if !ok {
-		return // traffic from outside of Tailnet (funneled)
+		return // traffic from outside of Tailnet (funneled or local machine)
 	}
 	if node.IsTagged() {
 		// 2023-06-14: Not setting identity headers for tagged nodes.
 		// Only currently set for nodes with user identities.
 		return
 	}
-	r.Out.Header.Set("Tailscale-User-Login", user.LoginName)
-	r.Out.Header.Set("Tailscale-User-Name", user.DisplayName)
+	r.Out.Header.Set("Tailscale-User-Login", encTailscaleHeaderValue(user.LoginName))
+	r.Out.Header.Set("Tailscale-User-Name", encTailscaleHeaderValue(user.DisplayName))
 	r.Out.Header.Set("Tailscale-User-Profile-Pic", user.ProfilePicURL)
 	r.Out.Header.Set("Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers")
+}
+
+// encTailscaleHeaderValue cleans or encodes as necessary v, to be suitable in
+// an HTTP header value. See
+// https://github.com/tailscale/tailscale/issues/11603.
+//
+// If v is not a valid UTF-8 string, it returns an empty string.
+// If v is a valid ASCII string, it returns v unmodified.
+// If v is a valid UTF-8 string with non-ASCII characters, it returns a
+// RFC 2047 Q-encoded string.
+func encTailscaleHeaderValue(v string) string {
+	if !utf8.ValidString(v) {
+		return ""
+	}
+	return mime.QEncoding.Encode("utf-8", v)
 }
 
 // serveWebHandler is an http.HandlerFunc that maps incoming requests to the
@@ -851,7 +998,7 @@ func expandProxyArg(s string) (targetURL string, insecureSkipVerify bool) {
 }
 
 func allNumeric(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
@@ -859,7 +1006,7 @@ func allNumeric(s string) bool {
 	return s != ""
 }
 
-func (b *LocalBackend) webServerConfig(hostname string, port uint16) (c ipn.WebServerConfigView, ok bool) {
+func (b *LocalBackend) webServerConfig(hostname string, forVIPService tailcfg.ServiceName, port uint16) (c ipn.WebServerConfigView, ok bool) {
 	key := ipn.HostPort(fmt.Sprintf("%s:%v", hostname, port))
 
 	b.mu.Lock()
@@ -868,15 +1015,18 @@ func (b *LocalBackend) webServerConfig(hostname string, port uint16) (c ipn.WebS
 	if !b.serveConfig.Valid() {
 		return c, false
 	}
+	if forVIPService != "" {
+		return b.serveConfig.FindServiceWeb(forVIPService, key)
+	}
 	return b.serveConfig.FindWeb(key)
 }
 
-func (b *LocalBackend) getTLSServeCertForPort(port uint16) func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+func (b *LocalBackend) getTLSServeCertForPort(port uint16, forVIPService tailcfg.ServiceName) func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if hi == nil || hi.ServerName == "" {
 			return nil, errors.New("no SNI ServerName")
 		}
-		_, ok := b.webServerConfig(hi.ServerName, port)
+		_, ok := b.webServerConfig(hi.ServerName, forVIPService, port)
 		if !ok {
 			return nil, errors.New("no webserver configured for name/port")
 		}

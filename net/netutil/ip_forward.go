@@ -1,11 +1,11 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-// Package netutil contains misc shared networking code & types.
 package netutil
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/netip"
 	"os"
@@ -15,13 +15,13 @@ import (
 	"strconv"
 	"strings"
 
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 )
 
 // protocolsRequiredForForwarding reports whether IPv4 and/or IPv6 protocols are
 // required to forward the specified routes.
 // The state param must be specified.
-func protocolsRequiredForForwarding(routes []netip.Prefix, state *interfaces.State) (v4, v6 bool) {
+func protocolsRequiredForForwarding(routes []netip.Prefix, state *netmon.State) (v4, v6 bool) {
 	if len(routes) == 0 {
 		// Nothing to route, so no need to warn.
 		return false, false
@@ -58,11 +58,16 @@ func protocolsRequiredForForwarding(routes []netip.Prefix, state *interfaces.Sta
 // It returns an error if it is unable to determine if IP forwarding is enabled.
 // It returns a warning describing configuration issues if IP forwarding is
 // non-functional or partly functional.
-func CheckIPForwarding(routes []netip.Prefix, state *interfaces.State) (warn, err error) {
+func CheckIPForwarding(routes []netip.Prefix, state *netmon.State) (warn, err error) {
 	if runtime.GOOS != "linux" {
 		switch runtime.GOOS {
 		case "dragonfly", "freebsd", "netbsd", "openbsd":
 			return fmt.Errorf("Subnet routing and exit nodes only work with additional manual configuration on %v, and is not currently officially supported.", runtime.GOOS), nil
+		case "illumos", "solaris":
+			_, err := ipForwardingEnabledSunOS(ipv4, "")
+			if err != nil {
+				return nil, fmt.Errorf("Couldn't check system's IP forwarding configuration, subnet routing/exit nodes may not work: %w%s", err, "")
+			}
 		}
 		return nil, nil
 	}
@@ -145,25 +150,19 @@ func CheckIPForwarding(routes []netip.Prefix, state *interfaces.State) (warn, er
 // disabled or set to 'loose' mode for exit node functionality on any
 // interface.
 //
-// The state param can be nil, in which case interfaces.GetState is used.
-//
 // The routes should only be advertised routes, and should not contain the
 // node's Tailscale IPs.
 //
 // This function returns an error if it is unable to determine whether reverse
 // path filtering is enabled, or a warning describing configuration issues if
 // reverse path fitering is non-functional or partly functional.
-func CheckReversePathFiltering(state *interfaces.State) (warn []string, err error) {
+func CheckReversePathFiltering(state *netmon.State) (warn []string, err error) {
 	if runtime.GOOS != "linux" {
 		return nil, nil
 	}
 
 	if state == nil {
-		var err error
-		state, err = interfaces.GetState()
-		if err != nil {
-			return nil, err
-		}
+		return nil, errors.New("no link state")
 	}
 
 	// The kernel uses the maximum value for rp_filter between the 'all'
@@ -330,4 +329,25 @@ func reversePathFilterValueLinux(iface string) (int, error) {
 		return -1, fmt.Errorf("couldn't parse %s (%v)", k, err)
 	}
 	return v, nil
+}
+
+func ipForwardingEnabledSunOS(p protocol, iface string) (bool, error) {
+	var proto string
+	if p == ipv4 {
+		proto = "ipv4"
+	} else if p == ipv6 {
+		proto = "ipv6"
+	} else {
+		return false, fmt.Errorf("unknown protocol")
+	}
+
+	ipadmCmd := "\"ipadm show-prop " + proto + " -p forwarding -o CURRENT -c\""
+	bs, err := exec.Command("ipadm", "show-prop", proto, "-p", "forwarding", "-o", "CURRENT", "-c").Output()
+	if err != nil {
+		return false, fmt.Errorf("couldn't check %s (%v).\nSubnet routes won't work without IP forwarding.", ipadmCmd, err)
+	}
+	if string(bs) != "on\n" {
+		return false, fmt.Errorf("IP forwarding is set to off. Subnet routes won't work. Try 'routeadm -u -e %s-forwarding'", proto)
+	}
+	return true, nil
 }

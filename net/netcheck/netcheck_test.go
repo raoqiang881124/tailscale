@@ -7,162 +7,41 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"tailscale.com/net/interfaces"
-	"tailscale.com/net/stun"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tstest"
+	"tailscale.com/tstest/nettest"
 )
 
-func TestHairpinSTUN(t *testing.T) {
-	tx := stun.NewTxID()
+func newTestClient(t testing.TB) *Client {
 	c := &Client{
-		curState: &reportState{
-			hairTX:      tx,
-			gotHairSTUN: make(chan netip.AddrPort, 1),
+		NetMon: netmon.NewStatic(),
+		Logf:   t.Logf,
+		TimeNow: func() time.Time {
+			return time.Unix(1729624521, 0)
 		},
 	}
-	req := stun.Request(tx)
-	if !stun.Is(req) {
-		t.Fatal("expected STUN message")
-	}
-	if !c.handleHairSTUNLocked(req, netip.AddrPort{}) {
-		t.Fatal("expected true")
-	}
-	select {
-	case <-c.curState.gotHairSTUN:
-	default:
-		t.Fatal("expected value")
-	}
-}
-
-func TestHairpinWait(t *testing.T) {
-	makeClient := func(t *testing.T) (*Client, *reportState) {
-		tx := stun.NewTxID()
-		c := &Client{}
-		req := stun.Request(tx)
-		if !stun.Is(req) {
-			t.Fatal("expected STUN message")
-		}
-
-		var err error
-		rs := &reportState{
-			c:           c,
-			hairTX:      tx,
-			gotHairSTUN: make(chan netip.AddrPort, 1),
-			hairTimeout: make(chan struct{}),
-			report:      newReport(),
-		}
-		rs.pc4Hair, err = net.ListenUDP("udp4", &net.UDPAddr{
-			IP:   net.ParseIP("127.0.0.1"),
-			Port: 0,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		c.curState = rs
-		return c, rs
-	}
-
-	ll, err := net.ListenPacket("udp", "localhost:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ll.Close()
-	dstAddr := netip.MustParseAddrPort(ll.LocalAddr().String())
-
-	t.Run("Success", func(t *testing.T) {
-		c, rs := makeClient(t)
-		req := stun.Request(rs.hairTX)
-
-		// Start a hairpin check to ourselves.
-		rs.startHairCheckLocked(dstAddr)
-
-		// Fake receiving the stun check from ourselves after some period of time.
-		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
-		c.handleHairSTUNLocked(req, src)
-
-		rs.waitHairCheck(context.Background())
-
-		// Verify that we set HairPinning
-		if got := rs.report.HairPinning; !got.EqualBool(true) {
-			t.Errorf("wanted HairPinning=true, got %v", got)
-		}
-	})
-
-	t.Run("LateReply", func(t *testing.T) {
-		c, rs := makeClient(t)
-		req := stun.Request(rs.hairTX)
-
-		// Start a hairpin check to ourselves.
-		rs.startHairCheckLocked(dstAddr)
-
-		// Wait until we've timed out, to mimic the race in #1795.
-		<-rs.hairTimeout
-
-		// Fake receiving the stun check from ourselves after some period of time.
-		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
-		c.handleHairSTUNLocked(req, src)
-
-		// Wait for a hairpin response
-		rs.waitHairCheck(context.Background())
-
-		// Verify that we set HairPinning
-		if got := rs.report.HairPinning; !got.EqualBool(true) {
-			t.Errorf("wanted HairPinning=true, got %v", got)
-		}
-	})
-
-	t.Run("Timeout", func(t *testing.T) {
-		_, rs := makeClient(t)
-
-		// Start a hairpin check to ourselves.
-		rs.startHairCheckLocked(dstAddr)
-
-		ctx, cancel := context.WithTimeout(context.Background(), hairpinCheckTimeout*50)
-		defer cancel()
-
-		// Wait in the background
-		waitDone := make(chan struct{})
-		go func() {
-			rs.waitHairCheck(ctx)
-			close(waitDone)
-		}()
-
-		// If we do nothing, then we time out; confirm that we set
-		// HairPinning to false in this case.
-		select {
-		case <-waitDone:
-			if got := rs.report.HairPinning; !got.EqualBool(false) {
-				t.Errorf("wanted HairPinning=false, got %v", got)
-			}
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for hairpin channel")
-		}
-	})
+	return c
 }
 
 func TestBasic(t *testing.T) {
 	stunAddr, cleanup := stuntest.Serve(t)
 	defer cleanup()
 
-	c := &Client{
-		Logf: t.Logf,
-	}
+	c := newTestClient(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
@@ -176,17 +55,57 @@ func TestBasic(t *testing.T) {
 	if !r.UDP {
 		t.Error("want UDP")
 	}
+	if r.Now.IsZero() {
+		t.Error("Now is zero")
+	}
 	if len(r.RegionLatency) != 1 {
 		t.Errorf("expected 1 key in DERPLatency; got %+v", r.RegionLatency)
 	}
 	if _, ok := r.RegionLatency[1]; !ok {
 		t.Errorf("expected key 1 in DERPLatency; got %+v", r.RegionLatency)
 	}
-	if r.GlobalV4 == "" {
+	if !r.GlobalV4.IsValid() {
 		t.Error("expected GlobalV4 set")
 	}
 	if r.PreferredDERP != 1 {
 		t.Errorf("PreferredDERP = %v; want 1", r.PreferredDERP)
+	}
+	v4Addrs, _ := r.GetGlobalAddrs()
+	if len(v4Addrs) != 1 {
+		t.Error("expected one global IPv4 address")
+	}
+	if got, want := v4Addrs[0], r.GlobalV4; got != want {
+		t.Errorf("got %v; want %v", got, want)
+	}
+}
+
+func TestMultiGlobalAddressMapping(t *testing.T) {
+	c := &Client{
+		Logf: t.Logf,
+	}
+
+	rs := &reportState{
+		c:      c,
+		start:  time.Now(),
+		report: newReport(),
+	}
+	derpNode := &tailcfg.DERPNode{}
+	port1 := netip.MustParseAddrPort("127.0.0.1:1234")
+	port2 := netip.MustParseAddrPort("127.0.0.1:2345")
+	port3 := netip.MustParseAddrPort("127.0.0.1:3456")
+	// First report for port1
+	rs.addNodeLatency(derpNode, port1, 10*time.Millisecond)
+	// Singular report for port2
+	rs.addNodeLatency(derpNode, port2, 11*time.Millisecond)
+	// Duplicate reports for port3
+	rs.addNodeLatency(derpNode, port3, 12*time.Millisecond)
+	rs.addNodeLatency(derpNode, port3, 13*time.Millisecond)
+
+	r := rs.report
+	v4Addrs, _ := r.GetGlobalAddrs()
+	wantV4Addrs := []netip.AddrPort{port1, port3}
+	if !slices.Equal(v4Addrs, wantV4Addrs) {
+		t.Errorf("got global addresses: %v, want %v", v4Addrs, wantV4Addrs)
 	}
 }
 
@@ -202,10 +121,9 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	dm := stuntest.DERPMapOf(stunAddr)
 	dm.Regions[1].Nodes[0].STUNOnly = true
 
-	c := &Client{
-		Logf: t.Logf,
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	c := newTestClient(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	r, err := c.GetReport(ctx, dm, nil)
@@ -217,6 +135,14 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	r.PCP = ""
 
 	want := newReport()
+
+	// The Now field can't be compared with reflect.DeepEqual; check using
+	// the Equal method and then overwrite it so that the comparison below
+	// succeeds.
+	if !r.Now.Equal(c.TimeNow()) {
+		t.Errorf("Now = %v; want %v", r.Now, c.TimeNow())
+	}
+	want.Now = r.Now
 
 	// The IPv4CanSend flag gets set differently across platforms.
 	// On Windows this test detects false, while on Linux detects true.
@@ -275,6 +201,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 		steps       []step
 		homeParams  *tailcfg.DERPHomeParams
 		opts        *GetReportOpts
+		forcedDERP  int // if non-zero, force this DERP to be the preferred one
 		wantDERP    int // want PreferredDERP on final step
 		wantPrevLen int // wanted len(c.prev)
 	}{
@@ -410,7 +337,7 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			},
 			opts: &GetReportOpts{
 				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
-					1: startTime.Add(2*time.Second + preferredDERPFrameTime/2), // within active window of step (3)
+					1: startTime.Add(2*time.Second + PreferredDERPFrameTime/2), // within active window of step (3)
 				}),
 			},
 			wantPrevLen: 3,
@@ -425,18 +352,80 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			},
 			opts: &GetReportOpts{
 				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
-					1: startTime.Add(4*time.Second - preferredDERPFrameTime - 1), // not within active window of (3)
+					1: startTime.Add(4*time.Second - PreferredDERPFrameTime - 1), // not within active window of (3)
 				}),
 			},
 			wantPrevLen: 3,
 			wantDERP:    2, // moved to d2 since d1 is gone
+		},
+		{
+			name: "preferred_derp_hysteresis_no_switch_pct",
+			steps: []step{
+				{0 * time.Second, report("d1", 34*time.Millisecond, "d2", 35*time.Millisecond)},
+				{1 * time.Second, report("d1", 34*time.Millisecond, "d2", 23*time.Millisecond)},
+			},
+			wantPrevLen: 2,
+			wantDERP:    1, // diff is 11ms, but d2 is greater than 2/3s of d1
+		},
+		{
+			name: "forced_two",
+			steps: []step{
+				{time.Second, report("d1", 2, "d2", 3)},
+				{2 * time.Second, report("d1", 4, "d2", 3)},
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    2,
+		},
+		{
+			name: "forced_two_unavailable",
+			steps: []step{
+				{time.Second, report("d1", 2, "d2", 1)},
+				{2 * time.Second, report("d1", 4)},
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    1,
+		},
+		{
+			name: "forced_two_no_probe_recent_activity",
+			steps: []step{
+				{time.Second, report("d1", 2)},
+				{2 * time.Second, report("d1", 4)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+					2: startTime.Add(time.Second),
+				}),
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    2,
+		},
+		{
+			name: "forced_two_no_probe_no_recent_activity",
+			steps: []step{
+				{time.Second, report("d1", 2)},
+				{PreferredDERPFrameTime + time.Second, report("d1", 4)},
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime,
+					2: startTime,
+				}),
+			},
+			forcedDERP:  2,
+			wantPrevLen: 2,
+			wantDERP:    1,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fakeTime := startTime
 			c := &Client{
-				TimeNow: func() time.Time { return fakeTime },
+				TimeNow:            func() time.Time { return fakeTime },
+				ForcePreferredDERP: tt.forcedDERP,
 			}
 			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams}
 			rs := &reportState{
@@ -664,14 +653,52 @@ func TestMakeProbePlan(t *testing.T) {
 				"region-3-v4": []probe{p("3a", 4)},
 			},
 		},
+		{
+			// #13969: ensure that the prior/current home region is always included in
+			// probe plans, so that we don't flap between regions due to a single major
+			// netcheck having excluded the home region due to a spuriously high sample.
+			name:    "ensure_home_region_inclusion",
+			dm:      basicMap,
+			have6if: true,
+			last: &Report{
+				RegionLatency: map[int]time.Duration{
+					1: 50 * time.Millisecond,
+					2: 20 * time.Millisecond,
+					3: 30 * time.Millisecond,
+					4: 40 * time.Millisecond,
+				},
+				RegionV4Latency: map[int]time.Duration{
+					1: 50 * time.Millisecond,
+					2: 20 * time.Millisecond,
+				},
+				RegionV6Latency: map[int]time.Duration{
+					3: 30 * time.Millisecond,
+					4: 40 * time.Millisecond,
+				},
+				PreferredDERP: 1,
+			},
+			want: probePlan{
+				"region-1-v4": []probe{p("1a", 4), p("1a", 4, 60*ms), p("1a", 4, 220*ms), p("1a", 4, 330*ms)},
+				"region-1-v6": []probe{p("1a", 6), p("1a", 6, 60*ms), p("1a", 6, 220*ms), p("1a", 6, 330*ms)},
+				"region-2-v4": []probe{p("2a", 4), p("2b", 4, 24*ms)},
+				"region-2-v6": []probe{p("2a", 6), p("2b", 6, 24*ms)},
+				"region-3-v4": []probe{p("3a", 4), p("3b", 4, 36*ms)},
+				"region-3-v6": []probe{p("3a", 6), p("3b", 6, 36*ms)},
+				"region-4-v4": []probe{p("4a", 4)},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ifState := &interfaces.State{
+			ifState := &netmon.State{
 				HaveV6: tt.have6if,
 				HaveV4: !tt.no4,
 			}
-			got := makeProbePlan(tt.dm, ifState, tt.last)
+			preferredDERP := 0
+			if tt.last != nil {
+				preferredDERP = tt.last.PreferredDERP
+			}
+			got := makeProbePlan(tt.dm, ifState, tt.last, preferredDERP)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("unexpected plan; got:\n%v\nwant:\n%v\n", got, tt.want)
 			}
@@ -681,13 +708,7 @@ func TestMakeProbePlan(t *testing.T) {
 
 func (plan probePlan) String() string {
 	var sb strings.Builder
-	keys := []string{}
-	for k := range plan {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
+	for _, key := range slices.Sorted(maps.Keys(plan)) {
 		fmt.Fprintf(&sb, "[%s]", key)
 		pv := plan[key]
 		for _, p := range pv {
@@ -710,18 +731,6 @@ func (p probe) String() string {
 	return fmt.Sprintf("%s-%s%s%s", p.node, p.proto, delay, wait)
 }
 
-func (p probeProto) String() string {
-	switch p {
-	case probeIPv4:
-		return "v4"
-	case probeIPv6:
-		return "v4"
-	case probeHTTPS:
-		return "https"
-	}
-	return "?"
-}
-
 func TestLogConciseReport(t *testing.T) {
 	dm := &tailcfg.DERPMap{
 		Regions: map[int]*tailcfg.DERPRegion{
@@ -739,12 +748,12 @@ func TestLogConciseReport(t *testing.T) {
 		{
 			name: "no_udp",
 			r:    &Report{},
-			want: "udp=false v4=false icmpv4=false v6=false mapvarydest= hair= portmap=? derp=0",
+			want: "udp=false v4=false icmpv4=false v6=false mapvarydest= portmap=? derp=0",
 		},
 		{
 			name: "no_udp_icmp",
 			r:    &Report{ICMPv4: true, IPv4: true},
-			want: "udp=false icmpv4=true v6=false mapvarydest= hair= portmap=? derp=0",
+			want: "udp=false icmpv4=true v6=false mapvarydest= portmap=? derp=0",
 		},
 		{
 			name: "ipv4_one_region",
@@ -759,7 +768,7 @@ func TestLogConciseReport(t *testing.T) {
 					1: 10 * ms,
 				},
 			},
-			want: "udp=true v6=false mapvarydest= hair= portmap=? derp=1 derpdist=1v4:10ms",
+			want: "udp=true v6=false mapvarydest= portmap=? derp=1 derpdist=1v4:10ms",
 		},
 		{
 			name: "ipv4_all_region",
@@ -778,7 +787,7 @@ func TestLogConciseReport(t *testing.T) {
 					3: 30 * ms,
 				},
 			},
-			want: "udp=true v6=false mapvarydest= hair= portmap=? derp=1 derpdist=1v4:10ms,2v4:20ms,3v4:30ms",
+			want: "udp=true v6=false mapvarydest= portmap=? derp=1 derpdist=1v4:10ms,2v4:20ms,3v4:30ms",
 		},
 		{
 			name: "ipboth_all_region",
@@ -803,7 +812,7 @@ func TestLogConciseReport(t *testing.T) {
 					3: 30 * ms,
 				},
 			},
-			want: "udp=true v6=true mapvarydest= hair= portmap=? derp=1 derpdist=1v4:10ms,1v6:10ms,2v4:20ms,2v6:20ms,3v4:30ms,3v6:30ms",
+			want: "udp=true v6=true mapvarydest= portmap=? derp=1 derpdist=1v4:10ms,1v6:10ms,2v4:20ms,2v6:20ms,3v4:30ms,3v6:30ms",
 		},
 		{
 			name: "portmap_all",
@@ -813,7 +822,7 @@ func TestLogConciseReport(t *testing.T) {
 				PMP:  "true",
 				PCP:  "true",
 			},
-			want: "udp=true v4=false v6=false mapvarydest= hair= portmap=UMC derp=0",
+			want: "udp=true v4=false v6=false mapvarydest= portmap=UMC derp=0",
 		},
 		{
 			name: "portmap_some",
@@ -823,7 +832,7 @@ func TestLogConciseReport(t *testing.T) {
 				PMP:  "false",
 				PCP:  "true",
 			},
-			want: "udp=true v4=false v6=false mapvarydest= hair= portmap=UC derp=0",
+			want: "udp=true v4=false v6=false mapvarydest= portmap=UC derp=0",
 		},
 	}
 	for _, tt := range tests {
@@ -862,7 +871,7 @@ func TestSortRegions(t *testing.T) {
 	report.RegionLatency[3] = time.Second * time.Duration(6)
 	report.RegionLatency[4] = time.Second * time.Duration(0)
 	report.RegionLatency[5] = time.Second * time.Duration(2)
-	sortedMap := sortRegions(unsortedMap, report)
+	sortedMap := sortRegions(unsortedMap, report, 0)
 
 	// Sorting by latency this should result in rid: 5, 2, 1, 3
 	// rid 4 with latency 0 should be at the end
@@ -876,55 +885,6 @@ func TestSortRegions(t *testing.T) {
 	}
 }
 
-func TestNoCaptivePortalWhenUDP(t *testing.T) {
-	// Override noRedirectClient to handle the /generate_204 endpoint
-	var generate204Called atomic.Bool
-	tr := RoundTripFunc(func(req *http.Request) *http.Response {
-		if !strings.HasSuffix(req.URL.String(), "/generate_204") {
-			panic("bad URL: " + req.URL.String())
-		}
-		generate204Called.Store(true)
-		return &http.Response{
-			StatusCode: http.StatusNoContent,
-			Header:     make(http.Header),
-		}
-	})
-
-	tstest.Replace(t, &noRedirectClient.Transport, http.RoundTripper(tr))
-
-	stunAddr, cleanup := stuntest.Serve(t)
-	defer cleanup()
-
-	c := &Client{
-		Logf:              t.Logf,
-		testEnoughRegions: 1,
-
-		// Set the delay long enough that we have time to cancel it
-		// when our STUN probe succeeds.
-		testCaptivePortalDelay: 10 * time.Second,
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-
-	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
-		t.Fatal(err)
-	}
-
-	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Should not have called our captive portal function.
-	if generate204Called.Load() {
-		t.Errorf("captive portal check called; expected no call")
-	}
-	if r.CaptivePortal != "" {
-		t.Errorf("got CaptivePortal=%q, want empty", r.CaptivePortal)
-	}
-}
-
 type RoundTripFunc func(req *http.Request) *http.Response
 
 func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -932,6 +892,7 @@ func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func TestNodeAddrResolve(t *testing.T) {
+	nettest.SkipIfNoNetwork(t)
 	c := &Client{
 		Logf:        t.Logf,
 		UseDNSCache: true,
@@ -980,8 +941,8 @@ func TestNodeAddrResolve(t *testing.T) {
 			c.UseDNSCache = tt
 
 			t.Run("IPv4", func(t *testing.T) {
-				ap := c.nodeAddr(ctx, dn, probeIPv4)
-				if !ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dn, dn.STUNPort, probeIPv4)
+				if !ok {
 					t.Fatal("expected valid AddrPort")
 				}
 				if !ap.Addr().Is4() {
@@ -995,8 +956,8 @@ func TestNodeAddrResolve(t *testing.T) {
 					t.Skipf("IPv6 may not work on this machine")
 				}
 
-				ap := c.nodeAddr(ctx, dn, probeIPv6)
-				if !ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dn, dn.STUNPort, probeIPv6)
+				if !ok {
 					t.Fatal("expected valid AddrPort")
 				}
 				if !ap.Addr().Is6() {
@@ -1005,12 +966,51 @@ func TestNodeAddrResolve(t *testing.T) {
 				t.Logf("got IPv6 addr: %v", ap)
 			})
 			t.Run("IPv6 Failure", func(t *testing.T) {
-				ap := c.nodeAddr(ctx, dnV4Only, probeIPv6)
-				if ap.IsValid() {
+				ap, ok := c.nodeAddrPort(ctx, dnV4Only, dn.STUNPort, probeIPv6)
+				if ok {
 					t.Fatalf("expected no addr but got: %v", ap)
 				}
 				t.Logf("correctly got invalid addr")
 			})
 		})
+	}
+}
+
+func TestReportTimeouts(t *testing.T) {
+	if ReportTimeout < stunProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than stunProbeTimeout (%v)", ReportTimeout, stunProbeTimeout)
+	}
+	if ReportTimeout < icmpProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than icmpProbeTimeout (%v)", ReportTimeout, icmpProbeTimeout)
+	}
+	if ReportTimeout < httpsProbeTimeout {
+		t.Errorf("ReportTimeout (%v) cannot be less than httpsProbeTimeout (%v)", ReportTimeout, httpsProbeTimeout)
+	}
+}
+
+func TestNoUDPNilGetReportOpts(t *testing.T) {
+	blackhole, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to open blackhole STUN listener: %v", err)
+	}
+	defer blackhole.Close()
+
+	dm := stuntest.DERPMapOf(blackhole.LocalAddr().String())
+	for _, region := range dm.Regions {
+		for _, n := range region.Nodes {
+			n.STUNOnly = false // exercise ICMP & HTTPS probing
+		}
+	}
+
+	c := newTestClient(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r, err := c.GetReport(ctx, dm, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.UDP {
+		t.Fatal("unexpected working UDP")
 	}
 }

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"runtime"
 	"strings"
@@ -32,10 +33,10 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 		subcommand = ""
 
 		cc          = "cc"
-		targetOS    = env.Get("GOOS", nativeGOOS)
-		targetArch  = env.Get("GOARCH", nativeGOARCH)
-		buildFlags  = []string{"-trimpath"}
-		cgoCflags   = []string{"-O3", "-std=gnu11"}
+		targetOS    = cmp.Or(env.Get("GOOS", ""), nativeGOOS)
+		targetArch  = cmp.Or(env.Get("GOARCH", ""), nativeGOARCH)
+		buildFlags  = []string{}
+		cgoCflags   = []string{"-O3", "-std=gnu11", "-g"}
 		cgoLdflags  []string
 		ldflags     []string
 		tags        = []string{"tailscale_go"}
@@ -44,6 +45,10 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 	)
 	if len(argv) > 1 {
 		subcommand = argv[1]
+	}
+
+	if subcommand != "test" {
+		buildFlags = append(buildFlags, "-trimpath")
 	}
 
 	switch subcommand {
@@ -61,6 +66,8 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 	}
 
 	switch targetOS {
+	case "android":
+		cgo = env.Get("CGO_ENABLED", "0") == "1"
 	case "linux":
 		// Getting Go to build a static binary with cgo enabled is a
 		// minor ordeal. The incantations you apparently need are
@@ -143,7 +150,11 @@ func autoflagsForTest(argv []string, env *Environment, goroot, nativeGOOS, nativ
 			case env.IsSet("MACOSX_DEPLOYMENT_TARGET"):
 				xcodeFlags = append(xcodeFlags, "-mmacosx-version-min="+env.Get("MACOSX_DEPLOYMENT_TARGET", ""))
 			case env.IsSet("TVOS_DEPLOYMENT_TARGET"):
-				xcodeFlags = append(xcodeFlags, "-mtvos-version-min="+env.Get("TVOS_DEPLOYMENT_TARGET", ""))
+				if env.Get("TARGET_DEVICE_PLATFORM_NAME", "") == "appletvsimulator" {
+					xcodeFlags = append(xcodeFlags, "-mtvos-simulator-version-min="+env.Get("TVOS_DEPLOYMENT_TARGET", ""))
+				} else {
+					xcodeFlags = append(xcodeFlags, "-mtvos-version-min="+env.Get("TVOS_DEPLOYMENT_TARGET", ""))
+				}
 			default:
 				return nil, nil, fmt.Errorf("invoked by Xcode but couldn't figure out deployment target. Did Xcode change its envvars again?")
 			}

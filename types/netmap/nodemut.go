@@ -5,7 +5,6 @@ package netmap
 
 import (
 	"cmp"
-	"fmt"
 	"net/netip"
 	"reflect"
 	"slices"
@@ -35,7 +34,7 @@ type NodeMutationDERPHome struct {
 }
 
 func (m NodeMutationDERPHome) Apply(n *tailcfg.Node) {
-	n.DERP = fmt.Sprintf("127.3.3.40:%v", m.DERPRegion)
+	n.HomeDERP = m.DERPRegion
 }
 
 // NodeMutation is a NodeMutation that says a node's endpoints have changed.
@@ -73,7 +72,7 @@ func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
 	var fields []reflect.StructField
 	rt := reflect.TypeFor[tailcfg.PeerChange]()
-	for i := 0; i < rt.NumField(); i++ {
+	for i := range rt.NumField() {
 		fields = append(fields, rt.Field(i))
 	}
 	return fields

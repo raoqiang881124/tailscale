@@ -23,8 +23,8 @@ type ConfigVAlpha struct {
 	OperatorUser *string `json:",omitempty"` // local user name who is allowed to operate tailscaled without being root or using sudo
 	Hostname     *string `json:",omitempty"`
 
-	AcceptDNS    opt.Bool `json:"acceptDNS,omitempty"` // --accept-dns
-	AcceptRoutes opt.Bool `json:"acceptRoutes,omitempty"`
+	AcceptDNS    opt.Bool `json:"acceptDNS,omitempty"`    // --accept-dns
+	AcceptRoutes opt.Bool `json:"acceptRoutes,omitempty"` // --accept-routes defaults to true
 
 	ExitNode                   *string  `json:"exitNode,omitempty"` // IP, StableID, or MagicDNS base name
 	AllowLANWhileUsingExitNode opt.Bool `json:"allowLANWhileUsingExitNode,omitempty"`
@@ -32,7 +32,12 @@ type ConfigVAlpha struct {
 	AdvertiseRoutes []netip.Prefix `json:",omitempty"`
 	DisableSNAT     opt.Bool       `json:",omitempty"`
 
-	NetfilterMode *string `json:",omitempty"` // "on", "off", "nodivert"
+	AdvertiseServices []string `json:",omitempty"`
+
+	AppConnector *AppConnectorPrefs `json:",omitempty"` // advertise app connector; defaults to false (if nil or explicitly set to false)
+
+	NetfilterMode       *string  `json:",omitempty"` // "on", "off", "nodivert"
+	NoStatefulFiltering opt.Bool `json:",omitempty"`
 
 	PostureChecking opt.Bool         `json:",omitempty"`
 	RunSSHServer    opt.Bool         `json:",omitempty"` // Tailscale SSH
@@ -40,6 +45,10 @@ type ConfigVAlpha struct {
 	ShieldsUp       opt.Bool         `json:",omitempty"`
 	AutoUpdate      *AutoUpdatePrefs `json:",omitempty"`
 	ServeConfigTemp *ServeConfig     `json:",omitempty"` // TODO(bradfitz,maisem): make separate stable type for this
+
+	// StaticEndpoints are additional, user-defined endpoints that this node
+	// should advertise amongst its wireguard endpoints.
+	StaticEndpoints []netip.AddrPort `json:",omitempty"`
 
 	// TODO(bradfitz,maisem): future something like:
 	// Profile map[string]*Config // keyed by alice@gmail.com, corp.com (TailnetSID)
@@ -50,6 +59,7 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 	if c == nil {
 		return mp, nil
 	}
+
 	mp.WantRunning = !c.Enabled.EqualBool(false)
 	mp.WantRunningSet = mp.WantRunning || c.Enabled != ""
 	if c.ServerURL != nil {
@@ -98,6 +108,11 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 		mp.NoSNAT = c.DisableSNAT.EqualBool(true)
 		mp.NoSNAT = true
 	}
+	if c.NoStatefulFiltering != "" {
+		mp.NoStatefulFiltering = c.NoStatefulFiltering
+		mp.NoStatefulFilteringSet = true
+	}
+
 	if c.NetfilterMode != nil {
 		m, err := preftype.ParseNetfilterMode(*c.NetfilterMode)
 		if err != nil {
@@ -125,6 +140,14 @@ func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
 	if c.AutoUpdate != nil {
 		mp.AutoUpdate = *c.AutoUpdate
 		mp.AutoUpdateSet = AutoUpdatePrefsMask{ApplySet: true, CheckSet: true}
+	}
+	if c.AppConnector != nil {
+		mp.AppConnector = *c.AppConnector
+		mp.AppConnectorSet = true
+	}
+	if c.AdvertiseServices != nil {
+		mp.AdvertiseServices = c.AdvertiseServices
+		mp.AdvertiseServicesSet = true
 	}
 	return mp, nil
 }

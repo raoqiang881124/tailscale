@@ -5,22 +5,47 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net"
 	"os"
+	"strconv"
+	"time"
 
 	"tailscale.com/net/stun"
 )
 
 func main() {
 	log.SetFlags(0)
+	var host string
+	port := "3478"
 
-	if len(os.Args) != 2 {
-		log.Fatalf("usage: %s <hostname>", os.Args[0])
+	var readTimeout time.Duration
+	flag.DurationVar(&readTimeout, "timeout", 3*time.Second, "response wait timeout")
+
+	flag.Parse()
+
+	values := flag.Args()
+	if len(values) < 1 || len(values) > 2 {
+		log.Printf("usage: %s <hostname> [port]", os.Args[0])
+		flag.PrintDefaults()
+		os.Exit(1)
+	} else {
+		for i, value := range values {
+			switch i {
+			case 0:
+				host = value
+			case 1:
+				port = value
+			}
+		}
 	}
-	host := os.Args[1]
+	_, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		log.Fatalf("invalid port: %v", err)
+	}
 
-	uaddr, err := net.ResolveUDPAddr("udp", host+":3478")
+	uaddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -37,6 +62,10 @@ func main() {
 		log.Fatal(err)
 	}
 
+	err = c.SetReadDeadline(time.Now().Add(readTimeout))
+	if err != nil {
+		log.Fatal(err)
+	}
 	var buf [1024]byte
 	n, raddr, err := c.ReadFromUDPAddrPort(buf[:])
 	if err != nil {

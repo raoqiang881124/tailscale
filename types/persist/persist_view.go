@@ -17,7 +17,7 @@ import (
 
 //go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=Persist
 
-// View returns a readonly view of Persist.
+// View returns a read-only view of Persist.
 func (p *Persist) View() PersistView {
 	return PersistView{ж: p}
 }
@@ -33,7 +33,7 @@ type PersistView struct {
 	ж *Persist
 }
 
-// Valid reports whether underlying value is non-nil.
+// Valid reports whether v's underlying value is non-nil.
 func (v PersistView) Valid() bool { return v.ж != nil }
 
 // AsStruct returns a clone of the underlying value which aliases no memory with
@@ -67,7 +67,6 @@ func (v PersistView) LegacyFrontendPrivateMachineKey() key.MachinePrivate {
 }
 func (v PersistView) PrivateNodeKey() key.NodePrivate    { return v.ж.PrivateNodeKey }
 func (v PersistView) OldPrivateNodeKey() key.NodePrivate { return v.ж.OldPrivateNodeKey }
-func (v PersistView) Provider() string                   { return v.ж.Provider }
 func (v PersistView) UserProfile() tailcfg.UserProfile   { return v.ж.UserProfile }
 func (v PersistView) NetworkLockKey() key.NLPrivate      { return v.ж.NetworkLockKey }
 func (v PersistView) NodeID() tailcfg.StableNodeID       { return v.ж.NodeID }
@@ -81,7 +80,6 @@ var _PersistViewNeedsRegeneration = Persist(struct {
 	LegacyFrontendPrivateMachineKey key.MachinePrivate
 	PrivateNodeKey                  key.NodePrivate
 	OldPrivateNodeKey               key.NodePrivate
-	Provider                        string
 	UserProfile                     tailcfg.UserProfile
 	NetworkLockKey                  key.NLPrivate
 	NodeID                          tailcfg.StableNodeID

@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/types/views"
 )
@@ -66,40 +68,11 @@ func TestCGNATRange(t *testing.T) {
 	}
 }
 
-func TestNewContainsIPFunc(t *testing.T) {
-	f := NewContainsIPFunc(views.SliceOf([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}))
-	if f(netip.MustParseAddr("8.8.8.8")) {
-		t.Fatal("bad")
-	}
-	if !f(netip.MustParseAddr("10.1.2.3")) {
-		t.Fatal("bad")
-	}
-	f = NewContainsIPFunc(views.SliceOf([]netip.Prefix{netip.MustParsePrefix("10.1.2.3/32")}))
-	if !f(netip.MustParseAddr("10.1.2.3")) {
-		t.Fatal("bad")
-	}
-	f = NewContainsIPFunc(views.SliceOf([]netip.Prefix{
-		netip.MustParsePrefix("10.1.2.3/32"),
-		netip.MustParsePrefix("::2/128"),
-	}))
-	if !f(netip.MustParseAddr("::2")) {
-		t.Fatal("bad")
-	}
-	f = NewContainsIPFunc(views.SliceOf([]netip.Prefix{
-		netip.MustParsePrefix("10.1.2.3/32"),
-		netip.MustParsePrefix("10.1.2.4/32"),
-		netip.MustParsePrefix("::2/128"),
-	}))
-	if !f(netip.MustParseAddr("10.1.2.4")) {
-		t.Fatal("bad")
-	}
-}
-
 var sinkIP netip.Addr
 
 func BenchmarkTailscaleServiceAddr(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sinkIP = TailscaleServiceIP()
 	}
 }
@@ -116,6 +89,204 @@ func TestUnmapVia(t *testing.T) {
 	for _, tt := range tests {
 		if got := UnmapVia(netip.MustParseAddr(tt.ip)).String(); got != tt.want {
 			t.Errorf("for %q: got %q, want %q", tt.ip, got, tt.want)
+		}
+	}
+}
+
+func TestIsExitNodeRoute(t *testing.T) {
+	tests := []struct {
+		pref netip.Prefix
+		want bool
+	}{
+		{
+			pref: AllIPv4(),
+			want: true,
+		},
+		{
+			pref: AllIPv6(),
+			want: true,
+		},
+		{
+			pref: netip.MustParsePrefix("1.1.1.1/0"),
+			want: false,
+		},
+		{
+			pref: netip.MustParsePrefix("1.1.1.1/1"),
+			want: false,
+		},
+		{
+			pref: netip.MustParsePrefix("192.168.0.0/24"),
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := IsExitRoute(tt.pref); got != tt.want {
+			t.Errorf("for %q: got %v, want %v", tt.pref, got, tt.want)
+		}
+	}
+}
+
+func TestWithoutExitRoutes(t *testing.T) {
+	tests := []struct {
+		prefs []netip.Prefix
+		want  []netip.Prefix
+	}{
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6()},
+			want:  []netip.Prefix{},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4()},
+			want:  []netip.Prefix{AllIPv4()},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/10")},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  []netip.Prefix{AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+		},
+	}
+
+	for _, tt := range tests {
+		got := WithoutExitRoutes(views.SliceOf(tt.prefs))
+		if diff := cmp.Diff(tt.want, got.AsSlice(), cmpopts.EquateEmpty(), cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })); diff != "" {
+			t.Errorf("unexpected route difference (-want +got):\n%s", diff)
+		}
+	}
+}
+
+func TestWithoutExitRoute(t *testing.T) {
+	tests := []struct {
+		prefs []netip.Prefix
+		want  []netip.Prefix
+	}{
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6()},
+			want:  []netip.Prefix{},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4()},
+			want:  []netip.Prefix{},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/10")},
+		},
+		{
+			prefs: []netip.Prefix{AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  []netip.Prefix{netip.MustParsePrefix("10.0.0.0/10")},
+		},
+	}
+
+	for _, tt := range tests {
+		got := WithoutExitRoute(views.SliceOf(tt.prefs))
+		if diff := cmp.Diff(tt.want, got.AsSlice(), cmpopts.EquateEmpty(), cmp.Comparer(func(a, b netip.Prefix) bool { return a == b })); diff != "" {
+			t.Errorf("unexpected route difference (-want +got):\n%s", diff)
+		}
+	}
+}
+
+func TestContainsExitRoute(t *testing.T) {
+	tests := []struct {
+		prefs []netip.Prefix
+		want  bool
+	}{
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6()},
+			want:  true,
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4()},
+			want:  true,
+		},
+		{
+			prefs: []netip.Prefix{AllIPv4(), AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  true,
+		},
+		{
+			prefs: []netip.Prefix{AllIPv6(), netip.MustParsePrefix("10.0.0.0/10")},
+			want:  true,
+		},
+		{
+			prefs: []netip.Prefix{netip.MustParsePrefix("10.0.0.0/10")},
+			want:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := ContainsExitRoute(views.SliceOf(tt.prefs)); got != tt.want {
+			t.Errorf("for %q: got %v, want %v", tt.prefs, got, tt.want)
+		}
+	}
+}
+
+func TestIsTailscaleIPv4(t *testing.T) {
+	tests := []struct {
+		in   netip.Addr
+		want bool
+	}{
+		{
+			in:   netip.MustParseAddr("100.67.19.57"),
+			want: true,
+		},
+		{
+			in:   netip.MustParseAddr("10.10.10.10"),
+			want: false,
+		},
+		{
+
+			in:   netip.MustParseAddr("fd7a:115c:a1e0:3f2b:7a1d:4e88:9c2b:7f01"),
+			want: false,
+		},
+		{
+			in:   netip.MustParseAddr("bc9d:0aa0:1f0a:69ab:eb5c:28e0:5456:a518"),
+			want: false,
+		},
+		{
+			in:   netip.MustParseAddr("100.115.92.157"),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		if got := IsTailscaleIPv4(tt.in); got != tt.want {
+			t.Errorf("IsTailscaleIPv4(%v) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestIsTailscaleIP(t *testing.T) {
+	tests := []struct {
+		in   netip.Addr
+		want bool
+	}{
+		{
+			in:   netip.MustParseAddr("100.67.19.57"),
+			want: true,
+		},
+		{
+			in:   netip.MustParseAddr("10.10.10.10"),
+			want: false,
+		},
+		{
+
+			in:   netip.MustParseAddr("fd7a:115c:a1e0:3f2b:7a1d:4e88:9c2b:7f01"),
+			want: true,
+		},
+		{
+			in:   netip.MustParseAddr("bc9d:0aa0:1f0a:69ab:eb5c:28e0:5456:a518"),
+			want: false,
+		},
+		{
+			in:   netip.MustParseAddr("100.115.92.157"),
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		if got := IsTailscaleIP(tt.in); got != tt.want {
+			t.Errorf("IsTailscaleIP(%v) = %v, want %v", tt.in, got, tt.want)
 		}
 	}
 }

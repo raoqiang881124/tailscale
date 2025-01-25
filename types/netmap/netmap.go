@@ -17,7 +17,8 @@ import (
 	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
-	"tailscale.com/wgengine/filter"
+	"tailscale.com/util/set"
+	"tailscale.com/wgengine/filter/filtertype"
 )
 
 // NetworkMap is the current state of the world.
@@ -26,6 +27,7 @@ import (
 // alias parts of previous NetworkMap values.
 type NetworkMap struct {
 	SelfNode   tailcfg.NodeView
+	AllCaps    set.Set[tailcfg.NodeCapability] // set version of SelfNode.Capabilities + SelfNode.CapMap
 	NodeKey    key.NodePublic
 	PrivateKey key.NodePrivate
 	Expiry     time.Time
@@ -38,7 +40,7 @@ type NetworkMap struct {
 	Peers []tailcfg.NodeView // sorted by Node.ID
 	DNS   tailcfg.DNSConfig
 
-	PacketFilter      []filter.Match
+	PacketFilter      []filtertype.Match
 	PacketFilterRules views.Slice[tailcfg.FilterRule]
 	SSHPolicy         *tailcfg.SSHPolicy // or nil, if not enabled/allowed
 
@@ -99,6 +101,54 @@ func (nm *NetworkMap) GetAddresses() views.Slice[netip.Prefix] {
 	return nm.SelfNode.Addresses()
 }
 
+// GetVIPServiceIPMap returns a map of service names to the slice of
+// VIP addresses that correspond to the service. The service names are
+// with the prefix "svc:".
+//
+// TODO(tailscale/corp##25997): cache the result of decoding the capmap so that
+// we don't have to decode it multiple times after each netmap update.
+func (nm *NetworkMap) GetVIPServiceIPMap() tailcfg.ServiceIPMappings {
+	if nm == nil {
+		return nil
+	}
+	if !nm.SelfNode.Valid() {
+		return nil
+	}
+
+	ipMaps, err := tailcfg.UnmarshalNodeCapJSON[tailcfg.ServiceIPMappings](nm.SelfNode.CapMap().AsMap(), tailcfg.NodeAttrServiceHost)
+	if len(ipMaps) != 1 || err != nil {
+		return nil
+	}
+
+	return ipMaps[0]
+}
+
+// GetIPVIPServiceMap returns a map of VIP addresses to the service
+// names that has the VIP address. The service names are with the
+// prefix "svc:".
+func (nm *NetworkMap) GetIPVIPServiceMap() IPServiceMappings {
+	var res IPServiceMappings
+	if nm == nil {
+		return res
+	}
+
+	if !nm.SelfNode.Valid() {
+		return res
+	}
+
+	serviceIPMap := nm.GetVIPServiceIPMap()
+	if serviceIPMap == nil {
+		return res
+	}
+	res = make(IPServiceMappings)
+	for svc, addrs := range serviceIPMap {
+		for _, addr := range addrs {
+			res[addr] = svc
+		}
+	}
+	return res
+}
+
 // AnyPeersAdvertiseRoutes reports whether any peer is advertising non-exit node routes.
 func (nm *NetworkMap) AnyPeersAdvertiseRoutes() bool {
 	for _, p := range nm.Peers {
@@ -120,6 +170,11 @@ func (nm *NetworkMap) GetMachineStatus() tailcfg.MachineStatus {
 	return tailcfg.MachineUnauthorized
 }
 
+// HasCap reports whether nm is non-nil and nm.AllCaps contains c.
+func (nm *NetworkMap) HasCap(c tailcfg.NodeCapability) bool {
+	return nm != nil && nm.AllCaps.Contains(c)
+}
+
 // PeerByTailscaleIP returns a peer's Node based on its Tailscale IP.
 //
 // If nm is nil or no peer is found, ok is false.
@@ -130,7 +185,7 @@ func (nm *NetworkMap) PeerByTailscaleIP(ip netip.Addr) (peer tailcfg.NodeView, o
 	}
 	for _, n := range nm.Peers {
 		ad := n.Addresses()
-		for i := 0; i < ad.Len(); i++ {
+		for i := range ad.Len() {
 			a := ad.At(i)
 			if a.Addr() == ip {
 				return n, true
@@ -190,21 +245,11 @@ func (nm *NetworkMap) DomainName() string {
 	return nm.Domain
 }
 
-// SelfCapabilities returns SelfNode.Capabilities if nm and nm.SelfNode are
-// non-nil. This is a method so we can use it in envknob/logknob without a
-// circular dependency.
-func (nm *NetworkMap) SelfCapabilities() views.Slice[tailcfg.NodeCapability] {
-	var zero views.Slice[tailcfg.NodeCapability]
-	if nm == nil || !nm.SelfNode.Valid() {
-		return zero
-	}
-	out := nm.SelfNode.Capabilities().AsSlice()
-	nm.SelfNode.CapMap().Range(func(k tailcfg.NodeCapability, _ views.Slice[tailcfg.RawMessage]) (cont bool) {
-		out = append(out, k)
-		return true
-	})
-
-	return views.SliceOf(out)
+// HasSelfCapability reports whether nm.SelfNode contains capability c.
+//
+// It exists to satisify an unused (as of 2025-01-04) interface in the logknob package.
+func (nm *NetworkMap) HasSelfCapability(c tailcfg.NodeCapability) bool {
+	return nm.AllCaps.Contains(c)
 }
 
 func (nm *NetworkMap) String() string {
@@ -272,15 +317,14 @@ func (a *NetworkMap) equalConciseHeader(b *NetworkMap) bool {
 // in nodeConciseEqual in sync.
 func printPeerConcise(buf *strings.Builder, p tailcfg.NodeView) {
 	aip := make([]string, p.AllowedIPs().Len())
-	for i := range aip {
-		a := p.AllowedIPs().At(i)
-		s := strings.TrimSuffix(fmt.Sprint(a), "/32")
+	for i, a := range p.AllowedIPs().All() {
+		s := strings.TrimSuffix(a.String(), "/32")
 		aip[i] = s
 	}
 
-	ep := make([]string, p.Endpoints().Len())
-	for i := range ep {
-		e := p.Endpoints().At(i).String()
+	epStrs := make([]string, p.Endpoints().Len())
+	for i, ep := range p.Endpoints().All() {
+		e := ep.String()
 		// Align vertically on the ':' between IP and port
 		colon := strings.IndexByte(e, ':')
 		spaces := 0
@@ -288,14 +332,11 @@ func printPeerConcise(buf *strings.Builder, p tailcfg.NodeView) {
 			spaces++
 			colon--
 		}
-		ep[i] = fmt.Sprintf("%21v", e+strings.Repeat(" ", spaces))
+		epStrs[i] = fmt.Sprintf("%21v", e+strings.Repeat(" ", spaces))
 	}
 
-	derp := p.DERP()
-	const derpPrefix = "127.3.3.40:"
-	if strings.HasPrefix(derp, derpPrefix) {
-		derp = "D" + derp[len(derpPrefix):]
-	}
+	derp := fmt.Sprintf("D%d", p.HomeDERP())
+
 	var discoShort string
 	if !p.DiscoKey().IsZero() {
 		discoShort = p.DiscoKey().ShortString() + " "
@@ -309,13 +350,13 @@ func printPeerConcise(buf *strings.Builder, p tailcfg.NodeView) {
 		discoShort,
 		derp,
 		strings.Join(aip, " "),
-		strings.Join(ep, " "))
+		strings.Join(epStrs, " "))
 }
 
 // nodeConciseEqual reports whether a and b are equal for the fields accessed by printPeerConcise.
 func nodeConciseEqual(a, b tailcfg.NodeView) bool {
 	return a.Key() == b.Key() &&
-		a.DERP() == b.DERP() &&
+		a.HomeDERP() == b.HomeDERP() &&
 		a.DiscoKey() == b.DiscoKey() &&
 		views.SliceEqual(a.AllowedIPs(), b.AllowedIPs()) &&
 		views.SliceEqual(a.Endpoints(), b.Endpoints())
@@ -381,6 +422,22 @@ func (nm *NetworkMap) JSON() string {
 type WGConfigFlags int
 
 const (
-	AllowSingleHosts WGConfigFlags = 1 << iota
+	_ WGConfigFlags = 1 << iota
 	AllowSubnetRoutes
 )
+
+// IPServiceMappings maps IP addresses to service names. This is the inverse of
+// [tailcfg.ServiceIPMappings], and is used to inform track which service a VIP
+// is associated with. This is set to b.ipVIPServiceMap every time the netmap is
+// updated. This is used to reduce the cost for looking up the service name for
+// the dst IP address in the netStack packet processing workflow.
+//
+// This is of the form:
+//
+//	{
+//	  "100.65.32.1": "svc:samba",
+//	  "fd7a:115c:a1e0::1234": "svc:samba",
+//	  "100.102.42.3": "svc:web",
+//	  "fd7a:115c:a1e0::abcd": "svc:web",
+//	}
+type IPServiceMappings map[netip.Addr]tailcfg.ServiceName

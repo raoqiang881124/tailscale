@@ -17,7 +17,9 @@ spec:
     - name: TS_KUBE_SECRET
       value: "{{TS_KUBE_SECRET}}"
     - name: TS_USERSPACE
-      value: "true"
+      value: "false"
+    - name: TS_DEBUG_FIREWALL_MODE
+      value: auto
     - name: TS_AUTHKEY
       valueFrom:
         secretKeyRef:
@@ -26,6 +28,13 @@ spec:
           optional: true
     - name: TS_ROUTES
       value: "{{TS_ROUTES}}"
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_UID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.uid
     securityContext:
-      runAsUser: 1000
-      runAsGroup: 1000
+      privileged: true
