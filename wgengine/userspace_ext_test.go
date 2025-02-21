@@ -9,15 +9,22 @@ import (
 	"github.com/tailscale/wireguard-go/tun"
 	"tailscale.com/net/tstun"
 	"tailscale.com/tsd"
+	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/wgengine"
-	"tailscale.com/wgengine/netstack"
 	"tailscale.com/wgengine/router"
 )
 
 func TestIsNetstack(t *testing.T) {
 	sys := new(tsd.System)
-	e, err := wgengine.NewUserspaceEngine(t.Logf, wgengine.Config{SetSubsystem: sys.Set})
+	e, err := wgengine.NewUserspaceEngine(
+		tstest.WhileTestRunningLogger(t),
+		wgengine.Config{
+			SetSubsystem:  sys.Set,
+			HealthTracker: sys.HealthTracker(),
+			Metrics:       sys.UserMetricsRegistry(),
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +58,7 @@ func TestIsNetstackRouter(t *testing.T) {
 			name: "hybrid_netstack",
 			conf: wgengine.Config{
 				Tun:    newFakeOSTUN(),
-				Router: netstack.NewSubnetRouterWrapper(newFakeOSRouter()),
+				Router: newFakeOSRouter(),
 			},
 			setNetstackRouter: true,
 			want:              true,
@@ -65,6 +72,8 @@ func TestIsNetstackRouter(t *testing.T) {
 			}
 			conf := tt.conf
 			conf.SetSubsystem = sys.Set
+			conf.HealthTracker = sys.HealthTracker()
+			conf.Metrics = sys.UserMetricsRegistry()
 			e, err := wgengine.NewUserspaceEngine(logger.Discard, conf)
 			if err != nil {
 				t.Fatal(err)

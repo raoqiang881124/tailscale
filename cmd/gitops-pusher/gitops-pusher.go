@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -28,19 +29,20 @@ import (
 )
 
 var (
-	rootFlagSet  = flag.NewFlagSet("gitops-pusher", flag.ExitOnError)
-	policyFname  = rootFlagSet.String("policy-file", "./policy.hujson", "filename for policy file")
-	cacheFname   = rootFlagSet.String("cache-file", "./version-cache.json", "filename for the previous known version hash")
-	timeout      = rootFlagSet.Duration("timeout", 5*time.Minute, "timeout for the entire CI run")
-	githubSyntax = rootFlagSet.Bool("github-syntax", true, "use GitHub Action error syntax (https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message)")
-	apiServer    = rootFlagSet.String("api-server", "api.tailscale.com", "API server to contact")
+	rootFlagSet       = flag.NewFlagSet("gitops-pusher", flag.ExitOnError)
+	policyFname       = rootFlagSet.String("policy-file", "./policy.hujson", "filename for policy file")
+	cacheFname        = rootFlagSet.String("cache-file", "./version-cache.json", "filename for the previous known version hash")
+	timeout           = rootFlagSet.Duration("timeout", 5*time.Minute, "timeout for the entire CI run")
+	githubSyntax      = rootFlagSet.Bool("github-syntax", true, "use GitHub Action error syntax (https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message)")
+	apiServer         = rootFlagSet.String("api-server", "api.tailscale.com", "API server to contact")
+	failOnManualEdits = rootFlagSet.Bool("fail-on-manual-edits", false, "fail if manual edits to the ACLs in the admin panel are detected; when set to false (the default) only a warning is printed")
 )
 
-func modifiedExternallyError() {
+func modifiedExternallyError() error {
 	if *githubSyntax {
-		fmt.Printf("::warning file=%s,line=1,col=1,title=Policy File Modified Externally::The policy file was modified externally in the admin console.\n", *policyFname)
+		return fmt.Errorf("::warning file=%s,line=1,col=1,title=Policy File Modified Externally::The policy file was modified externally in the admin console.", *policyFname)
 	} else {
-		fmt.Printf("The policy file was modified externally in the admin console.\n")
+		return fmt.Errorf("The policy file was modified externally in the admin console.")
 	}
 }
 
@@ -57,22 +59,28 @@ func apply(cache *Cache, client *http.Client, tailnet, apiKey string) func(conte
 		}
 
 		if cache.PrevETag == "" {
-			log.Println("no previous etag found, assuming local file is correct and recording that")
-			cache.PrevETag = localEtag
+			log.Println("no previous etag found, assuming the latest control etag")
+			cache.PrevETag = controlEtag
 		}
 
 		log.Printf("control: %s", controlEtag)
 		log.Printf("local:   %s", localEtag)
 		log.Printf("cache:   %s", cache.PrevETag)
 
-		if cache.PrevETag != controlEtag {
-			modifiedExternallyError()
-		}
-
 		if controlEtag == localEtag {
 			cache.PrevETag = localEtag
 			log.Println("no update needed, doing nothing")
 			return nil
+		}
+
+		if cache.PrevETag != controlEtag {
+			if err := modifiedExternallyError(); err != nil {
+				if *failOnManualEdits {
+					return err
+				} else {
+					fmt.Println(err)
+				}
+			}
 		}
 
 		if err := applyNewACL(ctx, client, tailnet, apiKey, *policyFname, controlEtag); err != nil {
@@ -98,21 +106,27 @@ func test(cache *Cache, client *http.Client, tailnet, apiKey string) func(contex
 		}
 
 		if cache.PrevETag == "" {
-			log.Println("no previous etag found, assuming local file is correct and recording that")
-			cache.PrevETag = localEtag
+			log.Println("no previous etag found, assuming the latest control etag")
+			cache.PrevETag = controlEtag
 		}
 
 		log.Printf("control: %s", controlEtag)
 		log.Printf("local:   %s", localEtag)
 		log.Printf("cache:   %s", cache.PrevETag)
 
-		if cache.PrevETag != controlEtag {
-			modifiedExternallyError()
-		}
-
 		if controlEtag == localEtag {
 			log.Println("no updates found, doing nothing")
 			return nil
+		}
+
+		if cache.PrevETag != controlEtag {
+			if err := modifiedExternallyError(); err != nil {
+				if *failOnManualEdits {
+					return err
+				} else {
+					fmt.Println(err)
+				}
+			}
 		}
 
 		if err := testNewACLs(ctx, client, tailnet, apiKey, *policyFname); err != nil {
@@ -135,8 +149,8 @@ func getChecksums(cache *Cache, client *http.Client, tailnet, apiKey string) fun
 		}
 
 		if cache.PrevETag == "" {
-			log.Println("no previous etag found, assuming local file is correct and recording that")
-			cache.PrevETag = Shuck(localEtag)
+			log.Println("no previous etag found, assuming control etag")
+			cache.PrevETag = Shuck(controlEtag)
 		}
 
 		log.Printf("control: %s", controlEtag)
@@ -392,7 +406,8 @@ func getACLETag(ctx context.Context, client *http.Client, tailnet, apiKey string
 	got := resp.StatusCode
 	want := http.StatusOK
 	if got != want {
-		return "", fmt.Errorf("wanted HTTP status code %d but got %d", want, got)
+		errorDetails, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("wanted HTTP status code %d but got %d: %#q", want, got, string(errorDetails))
 	}
 
 	return Shuck(resp.Header.Get("ETag")), nil

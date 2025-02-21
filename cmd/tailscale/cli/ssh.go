@@ -26,7 +26,7 @@ import (
 
 var sshCmd = &ffcli.Command{
 	Name:       "ssh",
-	ShortUsage: "ssh [user@]<host> [args...]",
+	ShortUsage: "tailscale ssh [user@]<host> [args...]",
 	ShortHelp:  "SSH to a Tailscale machine",
 	LongHelp: strings.TrimSpace(`
 
@@ -48,11 +48,11 @@ The 'tailscale ssh' wrapper adds a few things:
 }
 
 func runSSH(ctx context.Context, args []string) error {
-	if runtime.GOOS == "darwin" && version.IsSandboxedMacOS() && !envknob.UseWIPCode() {
-		return errors.New("The 'tailscale ssh' subcommand is not available on sandboxed macOS builds.\nUse the regular 'ssh' client instead.")
+	if runtime.GOOS == "darwin" && version.IsMacAppStore() && !envknob.UseWIPCode() {
+		return errors.New("The 'tailscale ssh' subcommand is not available on macOS builds distributed through the App Store or TestFlight.\nInstall the Standalone variant of Tailscale (download it from https://pkgs.tailscale.com), or use the regular 'ssh' client instead.")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: ssh [user@]<host>")
+		return errors.New("usage: tailscale ssh [user@]<host>")
 	}
 	arg, argRest := args[0], args[1:]
 	username, host, ok := strings.Cut(arg, "@")
@@ -84,10 +84,6 @@ func runSSH(ctx context.Context, args []string) error {
 		// of failing. But for now:
 		return fmt.Errorf("no system 'ssh' command found: %w", err)
 	}
-	tailscaleBin, err := os.Executable()
-	if err != nil {
-		return err
-	}
 	knownHostsFile, err := writeKnownHosts(st)
 	if err != nil {
 		return err
@@ -106,19 +102,19 @@ func runSSH(ctx context.Context, args []string) error {
 		"-o", "CanonicalizeHostname no", // https://github.com/tailscale/tailscale/issues/10348
 	)
 
-	// TODO(bradfitz): nc is currently broken on macOS:
-	// https://github.com/tailscale/tailscale/issues/4529
-	// So don't use it for now. MagicDNS is usually working on macOS anyway
-	// and they're not in userspace mode, so 'nc' isn't very useful.
+	// MagicDNS is usually working on macOS anyway and they're not in userspace
+	// mode, so 'nc' isn't very useful.
 	if runtime.GOOS != "darwin" {
 		socketArg := ""
-		if rootArgs.socket != "" && rootArgs.socket != paths.DefaultTailscaledSocket() {
-			socketArg = fmt.Sprintf("--socket=%q", rootArgs.socket)
+		if localClient.Socket != "" && localClient.Socket != paths.DefaultTailscaledSocket() {
+			socketArg = fmt.Sprintf("--socket=%q", localClient.Socket)
 		}
 
 		argv = append(argv,
 			"-o", fmt.Sprintf("ProxyCommand %q %s nc %%h %%p",
-				tailscaleBin,
+				// os.Executable() would return the real running binary but in case tailscale is built with the ts_include_cli tag,
+				// we need to return the started symlink instead
+				os.Args[0],
 				socketArg,
 			))
 	}

@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,8 +24,10 @@ import (
 	dns "golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
+	"tailscale.com/tstest"
 	"tailscale.com/types/dnstype"
 )
 
@@ -100,6 +102,16 @@ func TestResolversWithDelays(t *testing.T) {
 			name: "nextdns-doh-input",
 			in:   q("https://dns.nextdns.io/c3a884"),
 			want: o("https://dns.nextdns.io/c3a884"),
+		},
+		{
+			name: "controld-ipv6-expand",
+			in:   q("2606:1a40:0:6:7b5b:5949:35ad:0"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
+		},
+		{
+			name: "controld-doh-input",
+			in:   q("https://dns.controld.com/hyq3ipr2ct"),
+			want: o("https://dns.controld.com/hyq3ipr2ct"),
 		},
 	}
 
@@ -189,8 +201,8 @@ func BenchmarkNameFromQuery(b *testing.B) {
 	}
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_, err := nameFromQuery(msg)
+	for range b.N {
+		_, _, err := nameFromQuery(msg)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -265,6 +277,8 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 		tb.Fatal("cannot skip both UDP and TCP servers")
 	}
 
+	logf := tstest.WhileTestRunningLogger(tb)
+
 	tcpResponse := make([]byte, len(response)+2)
 	binary.BigEndian.PutUint16(tcpResponse, uint16(len(response)))
 	copy(tcpResponse[2:], response)
@@ -318,13 +332,13 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 		// Read the length header, then the buffer
 		var length uint16
 		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-			tb.Logf("error reading length header: %v", err)
+			logf("error reading length header: %v", err)
 			return
 		}
 		req := make([]byte, length)
 		n, err := io.ReadFull(conn, req)
 		if err != nil {
-			tb.Logf("error reading query: %v", err)
+			logf("error reading query: %v", err)
 			return
 		}
 		req = req[:n]
@@ -332,7 +346,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 
 		// Write response
 		if _, err := conn.Write(tcpResponse); err != nil {
-			tb.Logf("error writing response: %v", err)
+			logf("error writing response: %v", err)
 			return
 		}
 	}
@@ -356,7 +370,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	handleUDP := func(addr netip.AddrPort, req []byte) {
 		onRequest(false, req)
 		if _, err := udpLn.WriteToUDPAddrPort(response, addr); err != nil {
-			tb.Logf("error writing response: %v", err)
+			logf("error writing response: %v", err)
 		}
 	}
 
@@ -379,7 +393,7 @@ func runDNSServer(tb testing.TB, opts *testDNSServerOptions, response []byte, on
 	tb.Cleanup(func() {
 		tcpLn.Close()
 		udpLn.Close()
-		tb.Logf("waiting for listeners to finish...")
+		logf("waiting for listeners to finish...")
 		wg.Wait()
 	})
 	return
@@ -395,7 +409,7 @@ func enableDebug(tb testing.TB) {
 func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) {
 	name := dns.MustNewName(domain)
 
-	builder := dns.NewBuilder(nil, dns.Header{})
+	builder := dns.NewBuilder(nil, dns.Header{Response: true})
 	builder.StartQuestions()
 	builder.Question(dns.Question{
 		Name:  name,
@@ -403,7 +417,7 @@ func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) 
 		Class: dns.ClassINET,
 	})
 	builder.StartAnswers()
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		builder.AResource(dns.ResourceHeader{
 			Name:  name,
 			Class: dns.ClassINET,
@@ -438,8 +452,9 @@ func makeLargeResponse(tb testing.TB, domain string) (request, response []byte) 
 	return
 }
 
-func runTestQuery(tb testing.TB, port uint16, request []byte, modify func(*forwarder)) ([]byte, error) {
-	netMon, err := netmon.New(tb.Logf)
+func runTestQuery(tb testing.TB, request []byte, modify func(*forwarder), ports ...uint16) ([]byte, error) {
+	logf := tstest.WhileTestRunningLogger(tb)
+	netMon, err := netmon.New(logf)
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -447,28 +462,90 @@ func runTestQuery(tb testing.TB, port uint16, request []byte, modify func(*forwa
 	var dialer tsdial.Dialer
 	dialer.SetNetMon(netMon)
 
-	fwd := newForwarder(tb.Logf, netMon, nil, &dialer, nil)
+	fwd := newForwarder(logf, netMon, nil, &dialer, new(health.Tracker), nil)
 	if modify != nil {
 		modify(fwd)
 	}
 
-	fq := &forwardQuery{
-		txid:           getTxID(request),
-		packet:         request,
-		closeOnCtxDone: new(closePool),
-		family:         "tcp",
-	}
-	defer fq.closeOnCtxDone.Close()
-
-	rr := resolverAndDelay{
-		name: &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port)},
+	resolvers := make([]resolverAndDelay, len(ports))
+	for i, port := range ports {
+		resolvers[i].name = &dnstype.Resolver{Addr: fmt.Sprintf("127.0.0.1:%d", port)}
 	}
 
-	return fwd.send(context.Background(), fq, rr)
+	rpkt := packet{
+		bs:     request,
+		family: "tcp",
+		addr:   netip.MustParseAddrPort("127.0.0.1:12345"),
+	}
+
+	rchan := make(chan packet, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	tb.Cleanup(cancel)
+	err = fwd.forwardWithDestChan(ctx, rpkt, rchan, resolvers...)
+	select {
+	case res := <-rchan:
+		return res.bs, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
-func mustRunTestQuery(tb testing.TB, port uint16, request []byte, modify func(*forwarder)) []byte {
-	resp, err := runTestQuery(tb, port, request, modify)
+// makeTestRequest returns a new TypeA request for the given domain.
+func makeTestRequest(tb testing.TB, domain string) []byte {
+	tb.Helper()
+	name := dns.MustNewName(domain)
+	builder := dns.NewBuilder(nil, dns.Header{})
+	builder.StartQuestions()
+	builder.Question(dns.Question{
+		Name:  name,
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	})
+	request, err := builder.Finish()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return request
+}
+
+// makeTestResponse returns a new Type A response for the given domain,
+// with the specified status code and zero or more addresses.
+func makeTestResponse(tb testing.TB, domain string, code dns.RCode, addrs ...netip.Addr) []byte {
+	tb.Helper()
+	name := dns.MustNewName(domain)
+	builder := dns.NewBuilder(nil, dns.Header{
+		Response:      true,
+		Authoritative: true,
+		RCode:         code,
+	})
+	builder.StartQuestions()
+	q := dns.Question{
+		Name:  name,
+		Type:  dns.TypeA,
+		Class: dns.ClassINET,
+	}
+	builder.Question(q)
+	if len(addrs) > 0 {
+		builder.StartAnswers()
+		for _, addr := range addrs {
+			builder.AResource(dns.ResourceHeader{
+				Name:  q.Name,
+				Class: q.Class,
+				TTL:   120,
+			}, dns.AResource{
+				A: addr.As4(),
+			})
+		}
+	}
+	response, err := builder.Finish()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return response
+}
+
+func mustRunTestQuery(tb testing.TB, request []byte, modify func(*forwarder), ports ...uint16) []byte {
+	resp, err := runTestQuery(tb, request, modify, ports...)
 	if err != nil {
 		tb.Fatalf("error making request: %v", err)
 	}
@@ -497,7 +574,7 @@ func TestForwarderTCPFallback(t *testing.T) {
 		}
 	})
 
-	resp := mustRunTestQuery(t, port, request, nil)
+	resp := mustRunTestQuery(t, request, nil, port)
 	if !bytes.Equal(resp, largeResponse) {
 		t.Errorf("invalid response\ngot: %+v\nwant: %+v", resp, largeResponse)
 	}
@@ -535,7 +612,7 @@ func TestForwarderTCPFallbackTimeout(t *testing.T) {
 		}
 	})
 
-	resp := mustRunTestQuery(t, port, request, nil)
+	resp := mustRunTestQuery(t, request, nil, port)
 	if !bytes.Equal(resp, largeResponse) {
 		t.Errorf("invalid response\ngot: %+v\nwant: %+v", resp, largeResponse)
 	}
@@ -566,11 +643,11 @@ func TestForwarderTCPFallbackDisabled(t *testing.T) {
 		}
 	})
 
-	resp := mustRunTestQuery(t, port, request, func(fwd *forwarder) {
+	resp := mustRunTestQuery(t, request, func(fwd *forwarder) {
 		// Disable retries for this test.
 		fwd.controlKnobs = &controlknobs.Knobs{}
 		fwd.controlKnobs.DisableDNSForwarderTCPRetries.Store(true)
-	})
+	}, port)
 
 	wantResp := append([]byte(nil), largeResponse[:maxResponseBytes]...)
 
@@ -594,40 +671,10 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 	const domain = "error-response.tailscale.com."
 
 	// Our response is a SERVFAIL
-	response := func() []byte {
-		name := dns.MustNewName(domain)
-
-		builder := dns.NewBuilder(nil, dns.Header{
-			RCode: dns.RCodeServerFailure,
-		})
-		builder.StartQuestions()
-		builder.Question(dns.Question{
-			Name:  name,
-			Type:  dns.TypeA,
-			Class: dns.ClassINET,
-		})
-		response, err := builder.Finish()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return response
-	}()
+	response := makeTestResponse(t, domain, dns.RCodeServerFailure)
 
 	// Our request is a single A query for the domain in the answer, above.
-	request := func() []byte {
-		builder := dns.NewBuilder(nil, dns.Header{})
-		builder.StartQuestions()
-		builder.Question(dns.Question{
-			Name:  dns.MustNewName(domain),
-			Type:  dns.TypeA,
-			Class: dns.ClassINET,
-		})
-		request, err := builder.Finish()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return request
-	}()
+	request := makeTestRequest(t, domain)
 
 	var sawRequest atomic.Bool
 	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
@@ -637,13 +684,195 @@ func TestForwarderTCPFallbackError(t *testing.T) {
 		}
 	})
 
-	_, err := runTestQuery(t, port, request, nil)
+	resp, err := runTestQuery(t, request, nil, port)
 	if !sawRequest.Load() {
 		t.Error("did not see DNS request")
 	}
-	if err == nil {
-		t.Error("wanted error, got nil")
-	} else if !errors.Is(err, errServerFailure) {
-		t.Errorf("wanted errServerFailure, got: %v", err)
+	if err != nil {
+		t.Fatalf("wanted nil, got %v", err)
+	}
+	var parser dns.Parser
+	respHeader, err := parser.Start(resp)
+	if err != nil {
+		t.Fatalf("parser.Start() failed: %v", err)
+	}
+	if got, want := respHeader.RCode, dns.RCodeServerFailure; got != want {
+		t.Errorf("wanted %v, got %v", want, got)
+	}
+}
+
+// Test to ensure that if we have more than one resolver, and at least one of them
+// returns a successful response, we propagate it.
+func TestForwarderWithManyResolvers(t *testing.T) {
+	enableDebug(t)
+
+	const domain = "example.com."
+	request := makeTestRequest(t, domain)
+
+	tests := []struct {
+		name          string
+		responses     [][]byte // upstream responses
+		wantResponses [][]byte // we should receive one of these from the forwarder
+	}{
+		{
+			name: "Success",
+			responses: [][]byte{ // All upstream servers returned successful, but different, response.
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.2")),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.3")),
+			},
+			wantResponses: [][]byte{ // We may forward whichever response is received first.
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.2")),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.3")),
+			},
+		},
+		{
+			name: "ServFail",
+			responses: [][]byte{ // All upstream servers returned a SERVFAIL.
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+			},
+			wantResponses: [][]byte{
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+			},
+		},
+		{
+			name: "ServFail+Success",
+			responses: [][]byte{ // All upstream servers fail except for one.
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+			},
+			wantResponses: [][]byte{ // We should forward the successful response.
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+			},
+		},
+		{
+			name: "NXDomain",
+			responses: [][]byte{ // All upstream servers returned NXDOMAIN.
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeNameError),
+			},
+			wantResponses: [][]byte{
+				makeTestResponse(t, domain, dns.RCodeNameError),
+			},
+		},
+		{
+			name: "NXDomain+Success",
+			responses: [][]byte{ // All upstream servers returned NXDOMAIN except for one.
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+			},
+			wantResponses: [][]byte{ // However, only SERVFAIL are considered to be errors. Therefore, we may forward any response.
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+			},
+		},
+		{
+			name: "Refused",
+			responses: [][]byte{ // All upstream servers return different failures.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+			},
+			wantResponses: [][]byte{ // Refused is not considered to be an error and can be forwarded.
+				makeTestResponse(t, domain, dns.RCodeRefused),
+				makeTestResponse(t, domain, dns.RCodeSuccess, netip.MustParseAddr("127.0.0.1")),
+			},
+		},
+		{
+			name: "MixFail",
+			responses: [][]byte{ // All upstream servers return different failures.
+				makeTestResponse(t, domain, dns.RCodeServerFailure),
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+			wantResponses: [][]byte{ // Both NXDomain and Refused can be forwarded.
+				makeTestResponse(t, domain, dns.RCodeNameError),
+				makeTestResponse(t, domain, dns.RCodeRefused),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ports := make([]uint16, len(tt.responses))
+			for i := range tt.responses {
+				ports[i] = runDNSServer(t, nil, tt.responses[i], func(isTCP bool, gotRequest []byte) {})
+			}
+			gotResponse, err := runTestQuery(t, request, nil, ports...)
+			if err != nil {
+				t.Fatalf("wanted nil, got %v", err)
+			}
+			responseOk := slices.ContainsFunc(tt.wantResponses, func(wantResponse []byte) bool {
+				return slices.Equal(gotResponse, wantResponse)
+			})
+			if !responseOk {
+				t.Errorf("invalid response\ngot: %+v\nwant: %+v", gotResponse, tt.wantResponses[0])
+			}
+		})
+	}
+}
+
+// mdnsResponder at minimum has an expectation that NXDOMAIN must include the
+// question, otherwise it will penalize our server (#13511).
+func TestNXDOMAINIncludesQuestion(t *testing.T) {
+	var domain = "lb._dns-sd._udp.example.org."
+
+	// Our response is a NXDOMAIN
+	response := func() []byte {
+		name := dns.MustNewName(domain)
+
+		builder := dns.NewBuilder(nil, dns.Header{
+			Response: true,
+			RCode:    dns.RCodeNameError,
+		})
+		builder.StartQuestions()
+		builder.Question(dns.Question{
+			Name:  name,
+			Type:  dns.TypePTR,
+			Class: dns.ClassINET,
+		})
+		response, err := builder.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}()
+
+	// Our request is a single PTR query for the domain in the answer, above.
+	request := func() []byte {
+		builder := dns.NewBuilder(nil, dns.Header{})
+		builder.StartQuestions()
+		builder.Question(dns.Question{
+			Name:  dns.MustNewName(domain),
+			Type:  dns.TypePTR,
+			Class: dns.ClassINET,
+		})
+		request, err := builder.Finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}()
+
+	port := runDNSServer(t, nil, response, func(isTCP bool, gotRequest []byte) {
+	})
+
+	res, err := runTestQuery(t, request, nil, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(res, response) {
+		t.Errorf("invalid response\ngot: %+v\nwant: %+v", res, response)
 	}
 }

@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	insecurerand "math/rand"
+	randv2 "math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,7 +32,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tailscale/golang-x-crypto/acme"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
@@ -40,6 +39,8 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/ipn/store/mem"
+	"tailscale.com/net/bakedroots"
+	"tailscale.com/tempfork/acme"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/testenv"
 	"tailscale.com/version"
@@ -88,6 +89,17 @@ var acmeDebug = envknob.RegisterBool("TS_DEBUG_ACME")
 // If a cert is expired, it will be renewed synchronously otherwise it will be
 // renewed asynchronously.
 func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertKeyPair, error) {
+	return b.GetCertPEMWithValidity(ctx, domain, 0)
+}
+
+// GetCertPEMWithValidity gets the TLSCertKeyPair for domain, either from cache
+// or via the ACME process. ACME process is used for new domain certs, existing
+// expired certs or existing certs that should get renewed sooner than
+// minValidity.
+//
+// If a cert is expired, or expires sooner than minValidity, it will be renewed
+// synchronously. Otherwise it will be renewed asynchronously.
+func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string, minValidity time.Duration) (*TLSCertKeyPair, error) {
 	if !validLookingCertDomain(domain) {
 		return nil, errors.New("invalid domain")
 	}
@@ -109,17 +121,28 @@ func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertK
 	if pair, err := getCertPEMCached(cs, domain, now); err == nil {
 		// If we got here, we have a valid unexpired cert.
 		// Check whether we should start an async renewal.
-		if shouldRenew, err := b.shouldStartDomainRenewal(cs, domain, now, pair); err != nil {
+		shouldRenew, err := b.shouldStartDomainRenewal(cs, domain, now, pair, minValidity)
+		if err != nil {
 			logf("error checking for certificate renewal: %v", err)
-		} else if shouldRenew {
-			logf("starting async renewal")
-			// Start renewal in the background.
-			go b.getCertPEM(context.Background(), cs, logf, traceACME, domain, now)
+			// Renewal check failed, but the current cert is valid and not
+			// expired, so it's safe to return.
+			return pair, nil
 		}
-		return pair, nil
+		if !shouldRenew {
+			return pair, nil
+		}
+		if minValidity == 0 {
+			logf("starting async renewal")
+			// Start renewal in the background, return current valid cert.
+			go b.getCertPEM(context.Background(), cs, logf, traceACME, domain, now, minValidity)
+			return pair, nil
+		}
+		// If the caller requested a specific validity duration, fall through
+		// to synchronous renewal to fulfill that.
+		logf("starting sync renewal")
 	}
 
-	pair, err := b.getCertPEM(ctx, cs, logf, traceACME, domain, now)
+	pair, err := b.getCertPEM(ctx, cs, logf, traceACME, domain, now, minValidity)
 	if err != nil {
 		logf("getCertPEM: %v", err)
 		return nil, err
@@ -129,7 +152,14 @@ func (b *LocalBackend) GetCertPEM(ctx context.Context, domain string) (*TLSCertK
 
 // shouldStartDomainRenewal reports whether the domain's cert should be renewed
 // based on the current time, the cert's expiry, and the ARI check.
-func (b *LocalBackend) shouldStartDomainRenewal(cs certStore, domain string, now time.Time, pair *TLSCertKeyPair) (bool, error) {
+func (b *LocalBackend) shouldStartDomainRenewal(cs certStore, domain string, now time.Time, pair *TLSCertKeyPair, minValidity time.Duration) (bool, error) {
+	if minValidity != 0 {
+		cert, err := pair.parseCertificate()
+		if err != nil {
+			return false, fmt.Errorf("parsing certificate: %w", err)
+		}
+		return cert.NotAfter.Sub(now) < minValidity, nil
+	}
 	renewMu.Lock()
 	defer renewMu.Unlock()
 	if renewAt, ok := renewCertAt[domain]; ok {
@@ -157,11 +187,7 @@ func (b *LocalBackend) domainRenewed(domain string) {
 }
 
 func (b *LocalBackend) domainRenewalTimeByExpiry(pair *TLSCertKeyPair) (time.Time, error) {
-	block, _ := pem.Decode(pair.CertPEM)
-	if block == nil {
-		return time.Time{}, fmt.Errorf("parsing certificate PEM")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
+	cert, err := pair.parseCertificate()
 	if err != nil {
 		return time.Time{}, fmt.Errorf("parsing certificate: %w", err)
 	}
@@ -191,7 +217,7 @@ func (b *LocalBackend) domainRenewalTimeByARI(cs certStore, pair *TLSCertKeyPair
 		}
 		blocks = append(blocks, block)
 	}
-	if len(blocks) < 2 {
+	if len(blocks) < 1 {
 		return time.Time{}, fmt.Errorf("could not parse certificate chain from certStore, got %d PEM block(s)", len(blocks))
 	}
 	ac, err := acmeClient(cs)
@@ -200,7 +226,7 @@ func (b *LocalBackend) domainRenewalTimeByARI(cs certStore, pair *TLSCertKeyPair
 	}
 	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
 	defer cancel()
-	ri, err := ac.FetchRenewalInfo(ctx, blocks[0].Bytes, blocks[1].Bytes)
+	ri, err := ac.FetchRenewalInfo(ctx, blocks[0].Bytes)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("failed to fetch renewal info from ACME server: %w", err)
 	}
@@ -212,7 +238,7 @@ func (b *LocalBackend) domainRenewalTimeByARI(cs certStore, pair *TLSCertKeyPair
 	// passed. Time is randomized per recommendation in
 	// https://datatracker.ietf.org/doc/draft-ietf-acme-ari/
 	start, end := ri.SuggestedWindow.Start, ri.SuggestedWindow.End
-	renewTime := start.Add(time.Duration(insecurerand.Int63n(int64(end.Sub(start)))))
+	renewTime := start.Add(randv2.N(end.Sub(start)))
 	return renewTime, nil
 }
 
@@ -366,6 +392,17 @@ type TLSCertKeyPair struct {
 	Cached  bool   // whether result came from cache
 }
 
+func (kp TLSCertKeyPair) parseCertificate() (*x509.Certificate, error) {
+	block, _ := pem.Decode(kp.CertPEM)
+	if block == nil {
+		return nil, fmt.Errorf("error parsing certificate PEM")
+	}
+	if block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("PEM block is %q, not a CERTIFICATE", block.Type)
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
 func keyFile(dir, domain string) string  { return filepath.Join(dir, domain+".key") }
 func certFile(dir, domain string) string { return filepath.Join(dir, domain+".crt") }
 
@@ -383,7 +420,7 @@ func getCertPEMCached(cs certStore, domain string, now time.Time) (p *TLSCertKey
 	return cs.Read(domain, now)
 }
 
-func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time) (*TLSCertKeyPair, error) {
+func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*TLSCertKeyPair, error) {
 	acmeMu.Lock()
 	defer acmeMu.Unlock()
 
@@ -393,7 +430,7 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 	if p, err := getCertPEMCached(cs, domain, now); err == nil {
 		// shouldStartDomainRenewal caches its result so it's OK to call this
 		// frequently.
-		shouldRenew, err := b.shouldStartDomainRenewal(cs, domain, now, p)
+		shouldRenew, err := b.shouldStartDomainRenewal(cs, domain, now, p, minValidity)
 		if err != nil {
 			logf("error checking for certificate renewal: %v", err)
 		} else if !shouldRenew {
@@ -519,6 +556,7 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 	}
 
 	logf("requesting cert...")
+	traceACME(csr)
 	der, _, err := ac.CreateOrderCert(ctx, order.FinalizeURL, csr, true)
 	if err != nil {
 		return nil, fmt.Errorf("CreateOrder: %v", err)
@@ -541,10 +579,10 @@ func (b *LocalBackend) getCertPEM(ctx context.Context, cs certStore, logf logger
 }
 
 // certRequest generates a CSR for the given common name cn and optional SANs.
-func certRequest(key crypto.Signer, cn string, ext []pkix.Extension, san ...string) ([]byte, error) {
+func certRequest(key crypto.Signer, name string, ext []pkix.Extension) ([]byte, error) {
 	req := &x509.CertificateRequest{
-		Subject:         pkix.Name{CommonName: cn},
-		DNSNames:        san,
+		Subject:         pkix.Name{CommonName: name},
+		DNSNames:        []string{name},
 		ExtraExtensions: ext,
 	}
 	return x509.CreateCertificateRequest(rand.Reader, req, key)
@@ -621,15 +659,16 @@ func acmeClient(cs certStore) (*acme.Client, error) {
 	// LetsEncrypt), we should make sure that they support ARI extension (see
 	// shouldStartDomainRenewalARI).
 	return &acme.Client{
-		Key:       key,
-		UserAgent: "tailscaled/" + version.Long(),
+		Key:          key,
+		UserAgent:    "tailscaled/" + version.Long(),
+		DirectoryURL: envknob.String("TS_DEBUG_ACME_DIRECTORY_URL"),
 	}, nil
 }
 
 // validCertPEM reports whether the given certificate is valid for domain at now.
 //
 // If roots != nil, it is used instead of the system root pool. This is meant
-// to support testing, and production code should pass roots == nil.
+// to support testing; production code should pass roots == nil.
 func validCertPEM(domain string, keyPEM, certPEM []byte, roots *x509.CertPool, now time.Time) bool {
 	if len(keyPEM) == 0 || len(certPEM) == 0 {
 		return false
@@ -652,15 +691,29 @@ func validCertPEM(domain string, keyPEM, certPEM []byte, roots *x509.CertPool, n
 			intermediates.AddCert(cert)
 		}
 	}
+	return validateLeaf(leaf, intermediates, domain, now, roots)
+}
+
+// validateLeaf is a helper for [validCertPEM].
+//
+// If called with roots == nil, it will use the system root pool as well as the
+// baked-in roots. If non-nil, only those roots are used.
+func validateLeaf(leaf *x509.Certificate, intermediates *x509.CertPool, domain string, now time.Time, roots *x509.CertPool) bool {
 	if leaf == nil {
 		return false
 	}
-	_, err = leaf.Verify(x509.VerifyOptions{
+	_, err := leaf.Verify(x509.VerifyOptions{
 		DNSName:       domain,
 		CurrentTime:   now,
 		Roots:         roots,
 		Intermediates: intermediates,
 	})
+	if err != nil && roots == nil {
+		// If validation failed and they specified nil for roots (meaning to use
+		// the system roots), then give it another chance to validate using the
+		// binary's baked-in roots (LetsEncrypt). See tailscale/tailscale#14690.
+		return validateLeaf(leaf, intermediates, domain, now, bakedroots.Get())
+	}
 	return err == nil
 }
 

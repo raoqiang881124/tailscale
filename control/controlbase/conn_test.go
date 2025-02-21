@@ -91,7 +91,7 @@ func TestFastPath(t *testing.T) {
 
 	const packets = 10
 	s := "test"
-	for i := 0; i < packets; i++ {
+	for range packets {
 		// Many separate writes, to force separate Noise frames that
 		// all get buffered up and then all sent as a single slice to
 		// the server.
@@ -251,7 +251,7 @@ func TestConnMemoryOverhead(t *testing.T) {
 	}
 	defer closeAll()
 
-	for i := 0; i < num; i++ {
+	for range num {
 		client, server := pair(t)
 		closers = append(closers, client, server)
 		go func() {
@@ -280,7 +280,7 @@ func TestConnMemoryOverhead(t *testing.T) {
 	growthTotal := int64(ms.HeapAlloc) - int64(ms0.HeapAlloc)
 	growthEach := float64(growthTotal) / float64(num)
 	t.Logf("Alloced %v bytes, %.2f B/each", growthTotal, growthEach)
-	const max = 2000
+	const max = 2048
 	if growthEach > max {
 		t.Errorf("allocated more than expected; want max %v bytes/each", max)
 	}

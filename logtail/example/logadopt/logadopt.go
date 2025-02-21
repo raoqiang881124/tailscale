@@ -1,6 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Command logadopt is a CLI tool to adopt a machine into a logtail collection.
 package main
 
 import (
@@ -24,7 +25,7 @@ func main() {
 	}
 	log.SetFlags(0)
 
-	req, err := http.NewRequest("POST", "https://log.tailscale.io/instances", strings.NewReader(url.Values{
+	req, err := http.NewRequest("POST", "https://log.tailscale.com/instances", strings.NewReader(url.Values{
 		"collection": []string{*collection},
 		"instances":  []string{*publicID},
 		"adopt":      []string{"true"},

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,6 +22,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 )
 
@@ -53,6 +55,9 @@ func TestCleanMountPoint(t *testing.T) {
 }
 
 func TestServeConfigMutations(t *testing.T) {
+	tstest.Replace(t, &Stderr, io.Discard)
+	tstest.Replace(t, &Stdout, io.Discard)
+
 	// Stateful mutations, starting from an empty config.
 	type step struct {
 		command []string                       // serve args; nil means no command to run (only reset)
@@ -705,6 +710,7 @@ func TestServeConfigMutations(t *testing.T) {
 			lc:          lc,
 			testFlagOut: &flagOut,
 			testStdout:  &stdout,
+			testStderr:  io.Discard,
 		}
 		lastCount := lc.setCount
 		var cmd *ffcli.Command
@@ -715,6 +721,10 @@ func TestServeConfigMutations(t *testing.T) {
 		} else {
 			cmd = newServeLegacyCommand(e)
 			args = st.command
+		}
+		if cmd.FlagSet == nil {
+			cmd.FlagSet = flag.NewFlagSet(cmd.Name, flag.ContinueOnError)
+			cmd.FlagSet.SetOutput(Stdout)
 		}
 		err := cmd.ParseAndRun(context.Background(), args)
 		if flagOut.Len() > 0 {
@@ -749,6 +759,9 @@ func TestServeConfigMutations(t *testing.T) {
 }
 
 func TestVerifyFunnelEnabled(t *testing.T) {
+	tstest.Replace(t, &Stderr, io.Discard)
+	tstest.Replace(t, &Stdout, io.Discard)
+
 	lc := &fakeLocalServeClient{}
 	var stdout bytes.Buffer
 	var flagOut bytes.Buffer
@@ -756,6 +769,7 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 		lc:          lc,
 		testFlagOut: &flagOut,
 		testStdout:  &stdout,
+		testStderr:  io.Discard,
 	}
 
 	tests := []struct {
@@ -807,9 +821,11 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 			lc.setQueryFeatureResponse(tt.queryFeatureResponse)
 
 			if tt.caps != nil {
-				oldCaps := fakeStatus.Self.Capabilities
-				defer func() { fakeStatus.Self.Capabilities = oldCaps }() // reset after test
-				fakeStatus.Self.Capabilities = tt.caps
+				cm := make(tailcfg.NodeCapMap)
+				for _, c := range tt.caps {
+					cm[c] = nil
+				}
+				tstest.Replace(t, &fakeStatus.Self.CapMap, cm)
 			}
 
 			defer func() {
@@ -834,7 +850,7 @@ func TestVerifyFunnelEnabled(t *testing.T) {
 	}
 }
 
-// fakeLocalServeClient is a fake tailscale.LocalClient for tests.
+// fakeLocalServeClient is a fake local.Client for tests.
 // It's not a full implementation, just enough to test the serve command.
 //
 // The fake client is stateful, and is used to test manipulating
@@ -853,8 +869,11 @@ type fakeLocalServeClient struct {
 var fakeStatus = &ipnstate.Status{
 	BackendState: ipn.Running.String(),
 	Self: &ipnstate.PeerStatus{
-		DNSName:      "foo.test.ts.net",
-		Capabilities: []tailcfg.NodeCapability{tailcfg.NodeAttrFunnel, tailcfg.CapabilityFunnelPorts + "?ports=443,8443"},
+		DNSName: "foo.test.ts.net",
+		CapMap: tailcfg.NodeCapMap{
+			tailcfg.NodeAttrFunnel:                            nil,
+			tailcfg.CapabilityFunnelPorts + "?ports=443,8443": nil,
+		},
 	},
 }
 

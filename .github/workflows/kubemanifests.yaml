@@ -2,8 +2,8 @@ name: "Kubernetes manifests"
 on:
   pull_request:
    paths: 
-   - './cmd/k8s-operator/**'
-   - './k8s-operator/**'
+   - 'cmd/k8s-operator/**'
+   - 'k8s-operator/**'
    - '.github/workflows/kubemanifests.yaml'
 
 # Cancel workflow run if there is a newer push to the same PR for which it is
@@ -17,7 +17,7 @@ jobs:
     runs-on: [ ubuntu-latest ]
     steps:
     - name: Check out code
-      uses: actions/checkout@v4
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
     - name: Build and lint Helm chart
       run: |
         eval `./tool/go run ./cmd/mkversion`

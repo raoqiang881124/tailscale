@@ -1,6 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// Package appctest contains code to help test App Connectors.
 package appctest
 
 import (
@@ -10,12 +11,22 @@ import (
 
 // RouteCollector is a test helper that collects the list of routes advertised
 type RouteCollector struct {
+	// AdvertiseCallback (optional) is called synchronously from
+	// AdvertiseRoute.
+	AdvertiseCallback func()
+	// UnadvertiseCallback (optional) is called synchronously from
+	// UnadvertiseRoute.
+	UnadvertiseCallback func()
+
 	routes        []netip.Prefix
 	removedRoutes []netip.Prefix
 }
 
 func (rc *RouteCollector) AdvertiseRoute(pfx ...netip.Prefix) error {
 	rc.routes = append(rc.routes, pfx...)
+	if rc.AdvertiseCallback != nil {
+		rc.AdvertiseCallback()
+	}
 	return nil
 }
 
@@ -28,6 +39,9 @@ func (rc *RouteCollector) UnadvertiseRoute(toRemove ...netip.Prefix) error {
 		} else {
 			rc.removedRoutes = append(rc.removedRoutes, r)
 		}
+	}
+	if rc.UnadvertiseCallback != nil {
+		rc.UnadvertiseCallback()
 	}
 	return nil
 }

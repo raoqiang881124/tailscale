@@ -6,7 +6,6 @@
 package tailssh
 
 import (
-	"io"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,7 +17,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/envknob"
 	"tailscale.com/hostinfo"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 	"tailscale.com/util/osuser"
 	"tailscale.com/version/distro"
 )
@@ -34,14 +33,7 @@ type userMeta struct {
 
 // GroupIds returns the list of group IDs that the user is a member of.
 func (u *userMeta) GroupIds() ([]string, error) {
-	if runtime.GOOS == "linux" && distro.Get() == distro.Gokrazy {
-		// Gokrazy is a single-user appliance with ~no userspace.
-		// There aren't users to look up (no /etc/passwd, etc)
-		// so rather than fail below, just hardcode root.
-		// TODO(bradfitz): fix os/user upstream instead?
-		return []string{"0"}, nil
-	}
-	return u.User.GroupIds()
+	return osuser.GetGroupIds(&u.User)
 }
 
 // userLookup is like os/user.Lookup but it returns a *userMeta wrapper
@@ -51,6 +43,7 @@ func userLookup(username string) (*userMeta, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &userMeta{User: *u, loginShellCached: s}, nil
 }
 
@@ -116,15 +109,16 @@ func defaultPathForUser(u *user.User) string {
 }
 
 func defaultPathForUserOnNixOS(u *user.User) string {
-	var path string
-	lineread.File("/etc/pam/environment", func(lineb []byte) error {
-		if v := pathFromPAMEnvLine(lineb, u); v != "" {
-			path = v
-			return io.EOF // stop iteration
+	for lr := range lineiter.File("/etc/pam/environment") {
+		lineb, err := lr.Value()
+		if err != nil {
+			return ""
 		}
-		return nil
-	})
-	return path
+		if v := pathFromPAMEnvLine(lineb, u); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func pathFromPAMEnvLine(line []byte, u *user.User) (path string) {

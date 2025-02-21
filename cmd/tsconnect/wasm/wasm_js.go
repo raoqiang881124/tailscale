@@ -16,7 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/netip"
@@ -90,8 +90,11 @@ func newIPN(jsConfig js.Value) map[string]any {
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
-		// NewZstdEncoder is intentionally not passed in, compressed requests
-		// set HTTP headers that are not supported by the no-cors fetching mode.
+
+		// Compressed requests set HTTP headers that are not supported by the
+		// no-cors fetching mode:
+		CompressLogs: false,
+
 		HTTPC: &http.Client{Transport: &noCORSTransport{http.DefaultTransport}},
 	}
 	logtail := logtail.NewLogger(c, log.Printf)
@@ -101,16 +104,18 @@ func newIPN(jsConfig js.Value) map[string]any {
 	sys.Set(store)
 	dialer := &tsdial.Dialer{Logf: logf}
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
-		Dialer:       dialer,
-		SetSubsystem: sys.Set,
-		ControlKnobs: sys.ControlKnobs(),
+		Dialer:        dialer,
+		SetSubsystem:  sys.Set,
+		ControlKnobs:  sys.ControlKnobs(),
+		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 	sys.Set(eng)
 
-	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper(), nil)
+	ns, err := netstack.Create(logf, sys.Tun.Get(), eng, sys.MagicSock.Get(), dialer, sys.DNSManager.Get(), sys.ProxyMapper())
 	if err != nil {
 		log.Fatalf("netstack.Create: %v", err)
 	}
@@ -123,6 +128,9 @@ func newIPN(jsConfig js.Value) map[string]any {
 	}
 	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
+	}
+	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		return ns.DialContextUDP(ctx, dst)
 	}
 	sys.NetstackRouter.Set(true)
 	sys.Tun.Get().Start()
@@ -264,8 +272,8 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 						name = p.Hostinfo().Hostname()
 					}
 					addrs := make([]string, p.Addresses().Len())
-					for i := range p.Addresses().Len() {
-						addrs[i] = p.Addresses().At(i).Addr().String()
+					for i, ap := range p.Addresses().All() {
+						addrs[i] = ap.Addr().String()
 					}
 					return jsNetMapPeerNode{
 						jsNetMapNode: jsNetMapNode{
@@ -274,7 +282,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 							MachineKey: p.Machine().String(),
 							NodeKey:    p.Key().String(),
 						},
-						Online:              p.Online(),
+						Online:              p.Online().Clone(),
 						TailscaleSSHEnabled: p.Hostinfo().TailscaleSSHEnabled(),
 					}
 				}),
@@ -294,11 +302,10 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 	go func() {
 		err := i.lb.Start(ipn.Options{
 			UpdatePrefs: &ipn.Prefs{
-				ControlURL:       i.controlURL,
-				RouteAll:         false,
-				AllowSingleHosts: true,
-				WantRunning:      true,
-				Hostname:         i.hostname,
+				ControlURL:  i.controlURL,
+				RouteAll:    false,
+				WantRunning: true,
+				Hostname:    i.hostname,
 			},
 			AuthKey: i.authKey,
 		})
@@ -319,7 +326,7 @@ func (i *jsIPN) run(jsCallbacks js.Value) {
 }
 
 func (i *jsIPN) login() {
-	go i.lb.StartLoginInteractive()
+	go i.lb.StartLoginInteractive(context.Background())
 }
 
 func (i *jsIPN) logout() {
@@ -582,8 +589,8 @@ func mapSlice[T any, M any](a []T, f func(T) M) []M {
 
 func mapSliceView[T any, M any](a views.Slice[T], f func(T) M) []M {
 	n := make([]M, a.Len())
-	for i := range a.Len() {
-		n[i] = f(a.At(i))
+	for i, v := range a.All() {
+		n[i] = f(v)
 	}
 	return n
 }
@@ -601,7 +608,7 @@ func filterSlice[T any](a []T, f func(T) bool) []T {
 func generateHostname() string {
 	tails := words.Tails()
 	scales := words.Scales()
-	if rand.Int()%2 == 0 {
+	if rand.IntN(2) == 0 {
 		// JavaScript
 		tails = filterSlice(tails, func(s string) bool { return strings.HasPrefix(s, "j") })
 		scales = filterSlice(scales, func(s string) bool { return strings.HasPrefix(s, "s") })
@@ -611,8 +618,8 @@ func generateHostname() string {
 		scales = filterSlice(scales, func(s string) bool { return strings.HasPrefix(s, "a") })
 	}
 
-	tail := tails[rand.Intn(len(tails))]
-	scale := scales[rand.Intn(len(scales))]
+	tail := tails[rand.IntN(len(tails))]
+	scale := scales[rand.IntN(len(scales))]
 	return fmt.Sprintf("%s-%s", tail, scale)
 }
 

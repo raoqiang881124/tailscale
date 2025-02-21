@@ -63,13 +63,14 @@ type resolvedManager struct {
 	ctx    context.Context
 	cancel func() // terminate the context, for close
 
-	logf  logger.Logf
-	ifidx int
+	logf   logger.Logf
+	health *health.Tracker
+	ifidx  int
 
 	configCR chan changeRequest // tracks OSConfigs changes and error responses
 }
 
-func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManager, error) {
+func newResolvedManager(logf logger.Logf, health *health.Tracker, interfaceName string) (*resolvedManager, error) {
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
 		return nil, err
@@ -82,8 +83,9 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 		ctx:    ctx,
 		cancel: cancel,
 
-		logf:  logf,
-		ifidx: iface.Index,
+		logf:   logf,
+		health: health,
+		ifidx:  iface.Index,
 
 		configCR: make(chan changeRequest),
 	}
@@ -161,9 +163,9 @@ func (m *resolvedManager) run(ctx context.Context) {
 		}
 		conn.Signal(signals)
 
-		// Reset backoff and SetNSOSHealth after successful on reconnect.
+		// Reset backoff and set osConfigurationSetWarnable to healthy after a successful reconnect.
 		bo.BackOff(ctx, nil)
-		health.SetDNSOSHealth(nil)
+		m.health.SetHealthy(osConfigurationSetWarnable)
 		return nil
 	}
 
@@ -241,9 +243,12 @@ func (m *resolvedManager) run(ctx context.Context) {
 			// Set health while holding the lock, because this will
 			// graciously serialize the resync's health outcome with a
 			// concurrent SetDNS call.
-			health.SetDNSOSHealth(err)
+
 			if err != nil {
 				m.logf("failed to configure systemd-resolved: %v", err)
+				m.health.SetUnhealthy(osConfigurationSetWarnable, health.Args{health.ArgError: err.Error()})
+			} else {
+				m.health.SetHealthy(osConfigurationSetWarnable)
 			}
 		}
 	}

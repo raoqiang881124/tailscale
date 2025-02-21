@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	xmaps "golang.org/x/exp/maps"
+	"tailscale.com/util/slicesx"
 )
 
 func TestLRU(t *testing.T) {
@@ -47,6 +47,10 @@ func TestLRU(t *testing.T) {
 	if c.Contains(3) {
 		t.Errorf("contains 3; should not")
 	}
+	c.Clear()
+	if g, w := c.Len(), 0; g != w {
+		t.Errorf("Len = %d; want %d", g, w)
+	}
 }
 
 func TestLRUDeleteCorruption(t *testing.T) {
@@ -71,13 +75,13 @@ func TestStressEvictions(t *testing.T) {
 	for len(vm) < numKeys {
 		vm[rand.Uint64()] = true
 	}
-	vals := xmaps.Keys(vm)
+	vals := slicesx.MapKeys(vm)
 
 	c := Cache[uint64, bool]{
 		MaxEntries: cacheSize,
 	}
 
-	for i := 0; i < numProbes; i++ {
+	for range numProbes {
 		v := vals[rand.Intn(len(vals))]
 		c.Set(v, true)
 		if l := c.Len(); l > cacheSize {
@@ -102,11 +106,11 @@ func TestStressBatchedEvictions(t *testing.T) {
 	for len(vm) < numKeys {
 		vm[rand.Uint64()] = true
 	}
-	vals := xmaps.Keys(vm)
+	vals := slicesx.MapKeys(vm)
 
 	c := Cache[uint64, bool]{}
 
-	for i := 0; i < numProbes; i++ {
+	for range numProbes {
 		v := vals[rand.Intn(len(vals))]
 		c.Set(v, true)
 		if c.Len() == cacheSizeMax {
@@ -127,7 +131,7 @@ func TestLRUStress(t *testing.T) {
 		maxSize   = 500
 		numProbes = 5_000
 	)
-	for i := 0; i < numProbes; i++ {
+	for range numProbes {
 		n := rand.Intn(maxSize * 2)
 		op := rand.Intn(4)
 		switch op {
@@ -230,7 +234,7 @@ func BenchmarkLRU(b *testing.B) {
 
 	c := Cache[int, bool]{MaxEntries: lruSize}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		k := rand.Intn(maxval)
 		if !c.Get(k) {
 			c.Set(k, true)
