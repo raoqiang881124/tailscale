@@ -24,11 +24,10 @@ import (
 	"strings"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/metrics"
 	"tailscale.com/tsnet"
 	"tailscale.com/tsweb"
-	"tailscale.com/types/logger"
 )
 
 var (
@@ -58,8 +57,6 @@ func main() {
 	ts := &tsnet.Server{
 		Dir:      *tailscaleDir,
 		Hostname: *hostname,
-		// Make the stdout logs a clean audit log of connections.
-		Logf: logger.Discard,
 	}
 
 	if os.Getenv("TS_AUTHKEY") == "" {
@@ -108,7 +105,7 @@ type proxy struct {
 	upstreamHost     string // "my.database.com"
 	upstreamCertPool *x509.CertPool
 	downstreamCert   []tls.Certificate
-	client           *tailscale.LocalClient
+	client           *local.Client
 
 	activeSessions  expvar.Int
 	startedSessions expvar.Int
@@ -118,7 +115,7 @@ type proxy struct {
 // newProxy returns a proxy that forwards connections to
 // upstreamAddr. The upstream's TLS session is verified using the CA
 // cert(s) in upstreamCAPath.
-func newProxy(upstreamAddr, upstreamCAPath string, client *tailscale.LocalClient) (*proxy, error) {
+func newProxy(upstreamAddr, upstreamCAPath string, client *local.Client) (*proxy, error) {
 	bs, err := os.ReadFile(upstreamCAPath)
 	if err != nil {
 		return nil, err

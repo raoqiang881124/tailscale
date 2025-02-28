@@ -12,7 +12,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		if name := t.Field(i).Name; name != "_" {
 			fields = append(fields, name)
 		}
@@ -21,13 +21,12 @@ func fieldsOf(t reflect.Type) (fields []string) {
 }
 
 func TestPersistEqual(t *testing.T) {
-	persistHandles := []string{"LegacyFrontendPrivateMachineKey", "PrivateNodeKey", "OldPrivateNodeKey", "Provider", "UserProfile", "NetworkLockKey", "NodeID", "DisallowedTKAStateIDs"}
+	persistHandles := []string{"PrivateNodeKey", "OldPrivateNodeKey", "UserProfile", "NetworkLockKey", "NodeID", "DisallowedTKAStateIDs"}
 	if have := fieldsOf(reflect.TypeFor[Persist]()); !reflect.DeepEqual(have, persistHandles) {
 		t.Errorf("Persist.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, persistHandles)
 	}
 
-	m1 := key.NewMachine()
 	k1 := key.NewNode()
 	nl1 := key.NewNLPrivate()
 	tests := []struct {
@@ -38,17 +37,6 @@ func TestPersistEqual(t *testing.T) {
 		{nil, &Persist{}, false},
 		{&Persist{}, nil, false},
 		{&Persist{}, &Persist{}, true},
-
-		{
-			&Persist{LegacyFrontendPrivateMachineKey: m1},
-			&Persist{LegacyFrontendPrivateMachineKey: key.NewMachine()},
-			false,
-		},
-		{
-			&Persist{LegacyFrontendPrivateMachineKey: m1},
-			&Persist{LegacyFrontendPrivateMachineKey: m1},
-			true,
-		},
 
 		{
 			&Persist{PrivateNodeKey: k1},
@@ -72,16 +60,6 @@ func TestPersistEqual(t *testing.T) {
 			true,
 		},
 
-		{
-			&Persist{Provider: "google"},
-			&Persist{Provider: "o365"},
-			false,
-		},
-		{
-			&Persist{Provider: "google"},
-			&Persist{Provider: "google"},
-			true,
-		},
 		{
 			&Persist{UserProfile: tailcfg.UserProfile{
 				ID: tailcfg.UserID(3),

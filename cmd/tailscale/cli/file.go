@@ -26,7 +26,9 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
@@ -38,17 +40,11 @@ import (
 
 var fileCmd = &ffcli.Command{
 	Name:       "file",
-	ShortUsage: "file <cp|get> ...",
+	ShortUsage: "tailscale file <cp|get> ...",
 	ShortHelp:  "Send or receive files",
 	Subcommands: []*ffcli.Command{
 		fileCpCmd,
 		fileGetCmd,
-	},
-	Exec: func(context.Context, []string) error {
-		// TODO(bradfitz): is there a better ffcli way to
-		// annotate subcommand-required commands that don't
-		// have an exec body of their own?
-		return errors.New("file subcommand required; run 'tailscale file -h' for details")
 	},
 }
 
@@ -65,7 +61,7 @@ func (c *countingReader) Read(buf []byte) (int, error) {
 
 var fileCpCmd = &ffcli.Command{
 	Name:       "cp",
-	ShortUsage: "file cp <files...> <target>:",
+	ShortUsage: "tailscale file cp <files...> <target>:",
 	ShortHelp:  "Copy file(s) to a host",
 	Exec:       runCp,
 	FlagSet: (func() *flag.FlagSet {
@@ -273,46 +269,77 @@ func getTargetStableID(ctx context.Context, ipStr string) (id tailcfg.StableNode
 	if err != nil {
 		return "", false, err
 	}
-	fts, err := localClient.FileTargets(ctx)
-	if err != nil {
-		return "", false, err
-	}
-	for _, ft := range fts {
-		n := ft.Node
-		for _, a := range n.Addresses {
-			if a.Addr() != ip {
-				continue
-			}
-			isOffline = n.Online != nil && !*n.Online
-			return n.StableID, isOffline, nil
-		}
-	}
-	return "", false, fileTargetErrorDetail(ctx, ip)
-}
 
-// fileTargetErrorDetail returns a non-nil error saying why ip is an
-// invalid file sharing target.
-func fileTargetErrorDetail(ctx context.Context, ip netip.Addr) error {
-	found := false
-	if st, err := localClient.Status(ctx); err == nil && st.Self != nil {
-		for _, peer := range st.Peer {
-			for _, pip := range peer.TailscaleIPs {
-				if pip == ip {
-					found = true
-					if peer.UserID != st.Self.UserID {
-						return errors.New("owned by different user; can only send files to your own devices")
-					}
-				}
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		// This likely means tailscaled is unreachable or returned an error on /localapi/v0/status.
+		return "", false, fmt.Errorf("failed to get local status: %w", err)
+	}
+	if st == nil {
+		// Handle the case if the daemon returns nil with no error.
+		return "", false, errors.New("no status available")
+	}
+	if st.Self == nil {
+		// We have a status structure, but it doesn’t include Self info. Probably not connected.
+		return "", false, errors.New("local node is not configured or missing Self information")
+	}
+
+	// Find the PeerStatus that corresponds to ip.
+	var foundPeer *ipnstate.PeerStatus
+peerLoop:
+	for _, ps := range st.Peer {
+		for _, pip := range ps.TailscaleIPs {
+			if pip == ip {
+				foundPeer = ps
+				break peerLoop
 			}
 		}
 	}
-	if found {
-		return errors.New("target seems to be running an old Tailscale version")
+
+	// If we didn’t find a matching peer at all:
+	if foundPeer == nil {
+		if !tsaddr.IsTailscaleIP(ip) {
+			return "", false, fmt.Errorf("unknown target; %v is not a Tailscale IP address", ip)
+		}
+		return "", false, errors.New("unknown target; not in your Tailnet")
 	}
-	if !tsaddr.IsTailscaleIP(ip) {
-		return fmt.Errorf("unknown target; %v is not a Tailscale IP address", ip)
+
+	// We found a peer. Decide whether we can send files to it:
+	isOffline = !foundPeer.Online
+
+	switch foundPeer.TaildropTarget {
+	case ipnstate.TaildropTargetAvailable:
+		return foundPeer.ID, isOffline, nil
+
+	case ipnstate.TaildropTargetNoNetmapAvailable:
+		return "", isOffline, errors.New("cannot send files: no netmap available on this node")
+
+	case ipnstate.TaildropTargetIpnStateNotRunning:
+		return "", isOffline, errors.New("cannot send files: local Tailscale is not connected to the tailnet")
+
+	case ipnstate.TaildropTargetMissingCap:
+		return "", isOffline, errors.New("cannot send files: missing required Taildrop capability")
+
+	case ipnstate.TaildropTargetOffline:
+		return "", isOffline, errors.New("cannot send files: peer is offline")
+
+	case ipnstate.TaildropTargetNoPeerInfo:
+		return "", isOffline, errors.New("cannot send files: invalid or unrecognized peer")
+
+	case ipnstate.TaildropTargetUnsupportedOS:
+		return "", isOffline, errors.New("cannot send files: target's OS does not support Taildrop")
+
+	case ipnstate.TaildropTargetNoPeerAPI:
+		return "", isOffline, errors.New("cannot send files: target is not advertising a file sharing API")
+
+	case ipnstate.TaildropTargetOwnedByOtherUser:
+		return "", isOffline, errors.New("cannot send files: peer is owned by a different user")
+
+	case ipnstate.TaildropTargetUnknown:
+		fallthrough
+	default:
+		return "", isOffline, fmt.Errorf("cannot send files: unknown or indeterminate reason")
 	}
-	return errors.New("unknown target; not in your Tailnet")
 }
 
 const maxSniff = 4 << 20
@@ -412,7 +439,7 @@ func (v *onConflict) Set(s string) error {
 
 var fileGetCmd = &ffcli.Command{
 	Name:       "get",
-	ShortUsage: "file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
+	ShortUsage: "tailscale file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
 	ShortHelp:  "Move files out of the Tailscale file inbox",
 	Exec:       runFileGet,
 	FlagSet: (func() *flag.FlagSet {
@@ -420,10 +447,11 @@ var fileGetCmd = &ffcli.Command{
 		fs.BoolVar(&getArgs.wait, "wait", false, "wait for a file to arrive if inbox is empty")
 		fs.BoolVar(&getArgs.loop, "loop", false, "run get in a loop, receiving files as they come in")
 		fs.BoolVar(&getArgs.verbose, "verbose", false, "verbose output")
-		fs.Var(&getArgs.conflict, "conflict", `behavior when a conflicting (same-named) file already exists in the target directory.
+		fs.Var(&getArgs.conflict, "conflict", "`behavior`"+` when a conflicting (same-named) file already exists in the target directory.
 	skip:       skip conflicting files: leave them in the taildrop inbox and print an error. get any non-conflicting files
 	overwrite:  overwrite existing file
 	rename:     write to a new number-suffixed filename`)
+		ffcomplete.Flag(fs, "conflict", ffcomplete.Fixed("skip", "overwrite", "rename"))
 		return fs
 	})(),
 }
@@ -560,7 +588,7 @@ func runFileGetOneBatch(ctx context.Context, dir string) []error {
 
 func runFileGet(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: file get <target-directory>")
+		return errors.New("usage: tailscale file get <target-directory>")
 	}
 	log.SetFlags(0)
 

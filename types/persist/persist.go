@@ -21,20 +21,8 @@ import (
 type Persist struct {
 	_ structs.Incomparable
 
-	// LegacyFrontendPrivateMachineKey is here temporarily
-	// (starting 2020-09-28) during migration of Windows users'
-	// machine keys from frontend storage to the backend. On the
-	// first LocalBackend.Start call, the backend will initialize
-	// the real (backend-owned) machine key from the frontend's
-	// provided value (if non-zero), picking a new random one if
-	// needed. This field should be considered read-only from GUI
-	// frontends. The real value should not be written back in
-	// this field, lest the frontend persist it to disk.
-	LegacyFrontendPrivateMachineKey key.MachinePrivate `json:"PrivateMachineKey"`
-
 	PrivateNodeKey    key.NodePrivate
 	OldPrivateNodeKey key.NodePrivate // needed to request key rotation
-	Provider          string
 	UserProfile       tailcfg.UserProfile
 	NetworkLockKey    key.NLPrivate
 	NodeID            tailcfg.StableNodeID
@@ -51,9 +39,30 @@ func (p *Persist) PublicNodeKey() key.NodePublic {
 	return p.PrivateNodeKey.Public()
 }
 
+// PublicNodeKeyOK returns the public key for the node key.
+//
+// Unlike PublicNodeKey, it returns ok=false if there is no node private key
+// instead of panicking.
+func (p *Persist) PublicNodeKeyOK() (pub key.NodePublic, ok bool) {
+	if p.PrivateNodeKey.IsZero() {
+		return
+	}
+	return p.PrivateNodeKey.Public(), true
+}
+
 // PublicNodeKey returns the public key for the node key.
+//
+// It panics if there is no node private key. See PublicNodeKeyOK.
 func (p PersistView) PublicNodeKey() key.NodePublic {
 	return p.ж.PublicNodeKey()
+}
+
+// PublicNodeKeyOK returns the public key for the node key.
+//
+// Unlike PublicNodeKey, it returns ok=false if there is no node private key
+// instead of panicking.
+func (p PersistView) PublicNodeKeyOK() (_ key.NodePublic, ok bool) {
+	return p.ж.PublicNodeKeyOK()
 }
 
 func (p PersistView) Equals(p2 PersistView) bool {
@@ -75,10 +84,8 @@ func (p *Persist) Equals(p2 *Persist) bool {
 		return false
 	}
 
-	return p.LegacyFrontendPrivateMachineKey.Equal(p2.LegacyFrontendPrivateMachineKey) &&
-		p.PrivateNodeKey.Equal(p2.PrivateNodeKey) &&
+	return p.PrivateNodeKey.Equal(p2.PrivateNodeKey) &&
 		p.OldPrivateNodeKey.Equal(p2.OldPrivateNodeKey) &&
-		p.Provider == p2.Provider &&
 		p.UserProfile.Equal(&p2.UserProfile) &&
 		p.NetworkLockKey.Equal(p2.NetworkLockKey) &&
 		p.NodeID == p2.NodeID &&
@@ -87,18 +94,14 @@ func (p *Persist) Equals(p2 *Persist) bool {
 
 func (p *Persist) Pretty() string {
 	var (
-		mk     key.MachinePublic
 		ok, nk key.NodePublic
 	)
-	if !p.LegacyFrontendPrivateMachineKey.IsZero() {
-		mk = p.LegacyFrontendPrivateMachineKey.Public()
-	}
 	if !p.OldPrivateNodeKey.IsZero() {
 		ok = p.OldPrivateNodeKey.Public()
 	}
 	if !p.PrivateNodeKey.IsZero() {
 		nk = p.PublicNodeKey()
 	}
-	return fmt.Sprintf("Persist{lm=%v, o=%v, n=%v u=%#v}",
-		mk.ShortString(), ok.ShortString(), nk.ShortString(), p.UserProfile.LoginName)
+	return fmt.Sprintf("Persist{o=%v, n=%v u=%#v}",
+		ok.ShortString(), nk.ShortString(), p.UserProfile.LoginName)
 }

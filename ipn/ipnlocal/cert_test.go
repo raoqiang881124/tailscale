@@ -86,13 +86,9 @@ func TestCertStoreRoundTrip(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := test.store.WriteCert(testDomain, testCert); err != nil {
-				t.Fatalf("WriteCert: unexpected error: %v", err)
+			if err := test.store.WriteTLSCertAndKey(testDomain, testCert, testKey); err != nil {
+				t.Fatalf("WriteTLSCertAndKey: unexpected error: %v", err)
 			}
-			if err := test.store.WriteKey(testDomain, testKey); err != nil {
-				t.Fatalf("WriteKey: unexpected error: %v", err)
-			}
-
 			kp, err := test.store.Read(testDomain, testNow)
 			if err != nil {
 				t.Fatalf("Read: unexpected error: %v", err)
@@ -195,6 +191,22 @@ func TestShouldStartDomainRenewal(t *testing.T) {
 				if renew != tt.want {
 					t.Errorf("got renew=%v (ret=%v), want renew %v", renew, ret, tt.want)
 				}
+			}
+		})
+	}
+}
+
+func TestDebugACMEDirectoryURL(t *testing.T) {
+	for _, tc := range []string{"", "https://acme-staging-v02.api.letsencrypt.org/directory"} {
+		const setting = "TS_DEBUG_ACME_DIRECTORY_URL"
+		t.Run(tc, func(t *testing.T) {
+			t.Setenv(setting, tc)
+			ac, err := acmeClient(certStateStore{StateStore: new(mem.Store)})
+			if err != nil {
+				t.Fatalf("acmeClient creation err: %v", err)
+			}
+			if ac.DirectoryURL != tc {
+				t.Fatalf("acmeClient.DirectoryURL = %q, want %q", ac.DirectoryURL, tc)
 			}
 		})
 	}

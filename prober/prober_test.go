@@ -5,16 +5,22 @@ package prober
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"tailscale.com/tstest"
+	"tailscale.com/tsweb"
 )
 
 const (
@@ -51,10 +57,10 @@ func TestProberTiming(t *testing.T) {
 		}
 	}
 
-	p.Run("test-probe", probeInterval, nil, func(context.Context) error {
+	p.Run("test-probe", probeInterval, nil, FuncProbe(func(context.Context) error {
 		invoked <- struct{}{}
 		return nil
-	})
+	}))
 
 	waitActiveProbes(t, p, clk, 1)
 
@@ -93,10 +99,10 @@ func TestProberTimingSpread(t *testing.T) {
 		}
 	}
 
-	probe := p.Run("test-spread-probe", probeInterval, nil, func(context.Context) error {
+	probe := p.Run("test-spread-probe", probeInterval, nil, FuncProbe(func(context.Context) error {
 		invoked <- struct{}{}
 		return nil
-	})
+	}))
 
 	waitActiveProbes(t, p, clk, 1)
 
@@ -143,6 +149,74 @@ func TestProberTimingSpread(t *testing.T) {
 	notCalled()
 }
 
+func TestProberTimeout(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker)
+
+	var done sync.WaitGroup
+	done.Add(1)
+	pfunc := FuncProbe(func(ctx context.Context) error {
+		defer done.Done()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	pfunc.Timeout = time.Microsecond
+	probe := p.Run("foo", 30*time.Second, nil, pfunc)
+	waitActiveProbes(t, p, clk, 1)
+	done.Wait()
+	probe.mu.Lock()
+	info := probe.probeInfoLocked()
+	probe.mu.Unlock()
+	wantInfo := ProbeInfo{
+		Name:            "foo",
+		Interval:        30 * time.Second,
+		Labels:          map[string]string{"class": "", "name": "foo"},
+		Status:          ProbeStatusFailed,
+		Error:           "context deadline exceeded",
+		RecentResults:   []bool{false},
+		RecentLatencies: nil,
+	}
+	if diff := cmp.Diff(wantInfo, info, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End", "Latency")); diff != "" {
+		t.Fatalf("unexpected ProbeInfo (-want +got):\n%s", diff)
+	}
+	if got := info.Latency; got > time.Second {
+		t.Errorf("info.Latency = %v, want at most 1s", got)
+	}
+}
+
+func TestProberConcurrency(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker)
+
+	var ran atomic.Int64
+	stopProbe := make(chan struct{})
+	pfunc := FuncProbe(func(ctx context.Context) error {
+		ran.Add(1)
+		<-stopProbe
+		return nil
+	})
+	pfunc.Timeout = time.Hour
+	pfunc.Concurrency = 3
+	p.Run("foo", time.Second, nil, pfunc)
+	waitActiveProbes(t, p, clk, 1)
+
+	for range 50 {
+		clk.Advance(time.Second)
+	}
+
+	if err := tstest.WaitFor(convergenceTimeout, func() error {
+		if got, want := ran.Load(), int64(3); got != want {
+			return fmt.Errorf("expected %d probes to run concurrently, got %d", want, got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(stopProbe)
+}
+
 func TestProberRun(t *testing.T) {
 	clk := newFakeTime()
 	p := newForTest(clk.Now, clk.NewTicker)
@@ -155,13 +229,13 @@ func TestProberRun(t *testing.T) {
 	const startingProbes = 100
 	var probes []*Probe
 
-	for i := 0; i < startingProbes; i++ {
-		probes = append(probes, p.Run(fmt.Sprintf("probe%d", i), probeInterval, nil, func(context.Context) error {
+	for i := range startingProbes {
+		probes = append(probes, p.Run(fmt.Sprintf("probe%d", i), probeInterval, nil, FuncProbe(func(context.Context) error {
 			mu.Lock()
 			defer mu.Unlock()
 			cnt++
 			return nil
-		}))
+		})))
 	}
 
 	checkCnt := func(want int) {
@@ -207,13 +281,13 @@ func TestPrometheus(t *testing.T) {
 	p := newForTest(clk.Now, clk.NewTicker).WithMetricNamespace("probe")
 
 	var succeed atomic.Bool
-	p.Run("testprobe", probeInterval, map[string]string{"label": "value"}, func(context.Context) error {
+	p.Run("testprobe", probeInterval, map[string]string{"label": "value"}, FuncProbe(func(context.Context) error {
 		clk.Advance(aFewMillis)
 		if succeed.Load() {
 			return nil
 		}
 		return errors.New("failing, as instructed by test")
-	})
+	}))
 
 	waitActiveProbes(t, p, clk, 1)
 
@@ -221,16 +295,16 @@ func TestPrometheus(t *testing.T) {
 		want := fmt.Sprintf(`
 # HELP probe_interval_secs Probe interval in seconds
 # TYPE probe_interval_secs gauge
-probe_interval_secs{label="value",name="testprobe"} %f
+probe_interval_secs{class="",label="value",name="testprobe"} %f
 # HELP probe_start_secs Latest probe start time (seconds since epoch)
 # TYPE probe_start_secs gauge
-probe_start_secs{label="value",name="testprobe"} %d
+probe_start_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_end_secs Latest probe end time (seconds since epoch)
 # TYPE probe_end_secs gauge
-probe_end_secs{label="value",name="testprobe"} %d
+probe_end_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
-probe_result{label="value",name="testprobe"} 0
+probe_result{class="",label="value",name="testprobe"} 0
 `, probeInterval.Seconds(), epoch.Unix(), epoch.Add(aFewMillis).Unix())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
 			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_result")
@@ -248,19 +322,19 @@ probe_result{label="value",name="testprobe"} 0
 		want := fmt.Sprintf(`
 # HELP probe_interval_secs Probe interval in seconds
 # TYPE probe_interval_secs gauge
-probe_interval_secs{label="value",name="testprobe"} %f
+probe_interval_secs{class="",label="value",name="testprobe"} %f
 # HELP probe_start_secs Latest probe start time (seconds since epoch)
 # TYPE probe_start_secs gauge
-probe_start_secs{label="value",name="testprobe"} %d
+probe_start_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_end_secs Latest probe end time (seconds since epoch)
 # TYPE probe_end_secs gauge
-probe_end_secs{label="value",name="testprobe"} %d
+probe_end_secs{class="",label="value",name="testprobe"} %d
 # HELP probe_latency_millis Latest probe latency (ms)
 # TYPE probe_latency_millis gauge
-probe_latency_millis{label="value",name="testprobe"} %d
+probe_latency_millis{class="",label="value",name="testprobe"} %d
 # HELP probe_result Latest probe result (1 = success, 0 = failure)
 # TYPE probe_result gauge
-probe_result{label="value",name="testprobe"} 1
+probe_result{class="",label="value",name="testprobe"} 1
 `, probeInterval.Seconds(), start.Unix(), end.Unix(), aFewMillis.Milliseconds())
 		return testutil.GatherAndCompare(p.metrics, strings.NewReader(want),
 			"probe_interval_secs", "probe_start_secs", "probe_end_secs", "probe_latency_millis", "probe_result")
@@ -274,14 +348,14 @@ func TestOnceMode(t *testing.T) {
 	clk := newFakeTime()
 	p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
 
-	p.Run("probe1", probeInterval, nil, func(context.Context) error { return nil })
-	p.Run("probe2", probeInterval, nil, func(context.Context) error { return fmt.Errorf("error2") })
-	p.Run("probe3", probeInterval, nil, func(context.Context) error {
-		p.Run("probe4", probeInterval, nil, func(context.Context) error {
+	p.Run("probe1", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+	p.Run("probe2", probeInterval, nil, FuncProbe(func(context.Context) error { return fmt.Errorf("error2") }))
+	p.Run("probe3", probeInterval, nil, FuncProbe(func(context.Context) error {
+		p.Run("probe4", probeInterval, nil, FuncProbe(func(context.Context) error {
 			return fmt.Errorf("error4")
-		})
+		}))
 		return nil
-	})
+	}))
 
 	p.Wait()
 	wantCount := 4
@@ -290,6 +364,257 @@ func TestOnceMode(t *testing.T) {
 			t.Fatalf("expected %d %s metrics; got %d (error %s)", wantCount, metric, c, err)
 		}
 	}
+}
+
+func TestProberProbeInfo(t *testing.T) {
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+
+	p.Run("probe1", probeInterval, nil, FuncProbe(func(context.Context) error {
+		clk.Advance(500 * time.Millisecond)
+		return nil
+	}))
+	p.Run("probe2", probeInterval, nil, FuncProbe(func(context.Context) error { return fmt.Errorf("error2") }))
+	p.Wait()
+
+	info := p.ProbeInfo()
+	wantInfo := map[string]ProbeInfo{
+		"probe1": {
+			Name:            "probe1",
+			Interval:        probeInterval,
+			Labels:          map[string]string{"class": "", "name": "probe1"},
+			Latency:         500 * time.Millisecond,
+			Status:          ProbeStatusSucceeded,
+			RecentResults:   []bool{true},
+			RecentLatencies: []time.Duration{500 * time.Millisecond},
+		},
+		"probe2": {
+			Name:            "probe2",
+			Interval:        probeInterval,
+			Labels:          map[string]string{"class": "", "name": "probe2"},
+			Status:          ProbeStatusFailed,
+			Error:           "error2",
+			RecentResults:   []bool{false},
+			RecentLatencies: nil, // no latency for failed probes
+		},
+	}
+
+	if diff := cmp.Diff(wantInfo, info, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End")); diff != "" {
+		t.Fatalf("unexpected ProbeInfo (-want +got):\n%s", diff)
+	}
+}
+
+func TestProbeInfoRecent(t *testing.T) {
+	type probeResult struct {
+		latency time.Duration
+		err     error
+	}
+	tests := []struct {
+		name                    string
+		results                 []probeResult
+		wantProbeInfo           ProbeInfo
+		wantRecentSuccessRatio  float64
+		wantRecentMedianLatency time.Duration
+	}{
+		{
+			name:                    "no_runs",
+			wantProbeInfo:           ProbeInfo{Status: ProbeStatusUnknown},
+			wantRecentSuccessRatio:  0,
+			wantRecentMedianLatency: 0,
+		},
+		{
+			name:    "single_success",
+			results: []probeResult{{latency: 100 * time.Millisecond, err: nil}},
+			wantProbeInfo: ProbeInfo{
+				Latency:         100 * time.Millisecond,
+				Status:          ProbeStatusSucceeded,
+				RecentResults:   []bool{true},
+				RecentLatencies: []time.Duration{100 * time.Millisecond},
+			},
+			wantRecentSuccessRatio:  1,
+			wantRecentMedianLatency: 100 * time.Millisecond,
+		},
+		{
+			name:    "single_failure",
+			results: []probeResult{{latency: 100 * time.Millisecond, err: errors.New("error123")}},
+			wantProbeInfo: ProbeInfo{
+				Status:          ProbeStatusFailed,
+				RecentResults:   []bool{false},
+				RecentLatencies: nil,
+				Error:           "error123",
+			},
+			wantRecentSuccessRatio:  0,
+			wantRecentMedianLatency: 0,
+		},
+		{
+			name: "recent_mix",
+			results: []probeResult{
+				{latency: 10 * time.Millisecond, err: errors.New("error1")},
+				{latency: 20 * time.Millisecond, err: nil},
+				{latency: 30 * time.Millisecond, err: nil},
+				{latency: 40 * time.Millisecond, err: errors.New("error4")},
+				{latency: 50 * time.Millisecond, err: nil},
+				{latency: 60 * time.Millisecond, err: nil},
+				{latency: 70 * time.Millisecond, err: errors.New("error7")},
+				{latency: 80 * time.Millisecond, err: nil},
+			},
+			wantProbeInfo: ProbeInfo{
+				Status:        ProbeStatusSucceeded,
+				Latency:       80 * time.Millisecond,
+				RecentResults: []bool{false, true, true, false, true, true, false, true},
+				RecentLatencies: []time.Duration{
+					20 * time.Millisecond,
+					30 * time.Millisecond,
+					50 * time.Millisecond,
+					60 * time.Millisecond,
+					80 * time.Millisecond,
+				},
+			},
+			wantRecentSuccessRatio:  0.625,
+			wantRecentMedianLatency: 50 * time.Millisecond,
+		},
+		{
+			name: "only_last_10",
+			results: []probeResult{
+				{latency: 10 * time.Millisecond, err: errors.New("old_error")},
+				{latency: 20 * time.Millisecond, err: nil},
+				{latency: 30 * time.Millisecond, err: nil},
+				{latency: 40 * time.Millisecond, err: nil},
+				{latency: 50 * time.Millisecond, err: nil},
+				{latency: 60 * time.Millisecond, err: nil},
+				{latency: 70 * time.Millisecond, err: nil},
+				{latency: 80 * time.Millisecond, err: nil},
+				{latency: 90 * time.Millisecond, err: nil},
+				{latency: 100 * time.Millisecond, err: nil},
+				{latency: 110 * time.Millisecond, err: nil},
+			},
+			wantProbeInfo: ProbeInfo{
+				Status:        ProbeStatusSucceeded,
+				Latency:       110 * time.Millisecond,
+				RecentResults: []bool{true, true, true, true, true, true, true, true, true, true},
+				RecentLatencies: []time.Duration{
+					20 * time.Millisecond,
+					30 * time.Millisecond,
+					40 * time.Millisecond,
+					50 * time.Millisecond,
+					60 * time.Millisecond,
+					70 * time.Millisecond,
+					80 * time.Millisecond,
+					90 * time.Millisecond,
+					100 * time.Millisecond,
+					110 * time.Millisecond,
+				},
+			},
+			wantRecentSuccessRatio:  1,
+			wantRecentMedianLatency: 70 * time.Millisecond,
+		},
+	}
+
+	clk := newFakeTime()
+	p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			probe := newProbe(p, "", probeInterval, nil, FuncProbe(func(context.Context) error { return nil }))
+			for _, r := range tt.results {
+				probe.recordStart()
+				clk.Advance(r.latency)
+				probe.recordEndLocked(r.err)
+			}
+			probe.mu.Lock()
+			info := probe.probeInfoLocked()
+			probe.mu.Unlock()
+			if diff := cmp.Diff(tt.wantProbeInfo, info, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End", "Interval")); diff != "" {
+				t.Fatalf("unexpected ProbeInfo (-want +got):\n%s", diff)
+			}
+			if got := info.RecentSuccessRatio(); got != tt.wantRecentSuccessRatio {
+				t.Errorf("recentSuccessRatio() = %v, want %v", got, tt.wantRecentSuccessRatio)
+			}
+			if got := info.RecentMedianLatency(); got != tt.wantRecentMedianLatency {
+				t.Errorf("recentMedianLatency() = %v, want %v", got, tt.wantRecentMedianLatency)
+			}
+		})
+	}
+}
+
+func TestProberRunHandler(t *testing.T) {
+	clk := newFakeTime()
+
+	tests := []struct {
+		name                  string
+		probeFunc             func(context.Context) error
+		wantResponseCode      int
+		wantJSONResponse      RunHandlerResponse
+		wantPlaintextResponse string
+	}{
+		{
+			name:             "success",
+			probeFunc:        func(context.Context) error { return nil },
+			wantResponseCode: 200,
+			wantJSONResponse: RunHandlerResponse{
+				ProbeInfo: ProbeInfo{
+					Name:          "success",
+					Interval:      probeInterval,
+					Status:        ProbeStatusSucceeded,
+					RecentResults: []bool{true, true},
+				},
+				PreviousSuccessRatio: 1,
+			},
+			wantPlaintextResponse: "Probe succeeded",
+		},
+		{
+			name:             "failure",
+			probeFunc:        func(context.Context) error { return fmt.Errorf("error123") },
+			wantResponseCode: 424,
+			wantJSONResponse: RunHandlerResponse{
+				ProbeInfo: ProbeInfo{
+					Name:          "failure",
+					Interval:      probeInterval,
+					Status:        ProbeStatusFailed,
+					Error:         "error123",
+					RecentResults: []bool{false, false},
+				},
+			},
+			wantPlaintextResponse: "Probe failed",
+		},
+	}
+
+	for _, tt := range tests {
+		for _, reqJSON := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s_json-%v", tt.name, reqJSON), func(t *testing.T) {
+				p := newForTest(clk.Now, clk.NewTicker).WithOnce(true)
+				probe := p.Run(tt.name, probeInterval, nil, FuncProbe(tt.probeFunc))
+				defer probe.Close()
+				<-probe.stopped // wait for the first run.
+
+				w := httptest.NewRecorder()
+
+				req := httptest.NewRequest("GET", "/prober/run/?name="+tt.name, nil)
+				if reqJSON {
+					req.Header.Set("Accept", "application/json")
+				}
+				tsweb.StdHandler(tsweb.ReturnHandlerFunc(p.RunHandler), tsweb.HandlerOptions{}).ServeHTTP(w, req)
+				if w.Result().StatusCode != tt.wantResponseCode {
+					t.Errorf("unexpected response code: got %d, want %d", w.Code, tt.wantResponseCode)
+				}
+
+				if reqJSON {
+					var gotJSON RunHandlerResponse
+					if err := json.Unmarshal(w.Body.Bytes(), &gotJSON); err != nil {
+						t.Fatalf("failed to unmarshal JSON response: %v; body: %s", err, w.Body.String())
+					}
+					if diff := cmp.Diff(tt.wantJSONResponse, gotJSON, cmpopts.IgnoreFields(ProbeInfo{}, "Start", "End", "Labels", "RecentLatencies")); diff != "" {
+						t.Errorf("unexpected JSON response (-want +got):\n%s", diff)
+					}
+				} else {
+					body, _ := io.ReadAll(w.Result().Body)
+					if !strings.Contains(string(body), tt.wantPlaintextResponse) {
+						t.Errorf("unexpected response body: got %q, want to contain %q", body, tt.wantPlaintextResponse)
+					}
+				}
+			})
+		}
+	}
+
 }
 
 type fakeTicker struct {

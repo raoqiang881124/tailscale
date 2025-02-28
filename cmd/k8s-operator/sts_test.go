@@ -14,9 +14,11 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/yaml"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/types/ptr"
@@ -51,14 +53,18 @@ func Test_statefulSetNameBase(t *testing.T) {
 }
 
 func Test_applyProxyClassToStatefulSet(t *testing.T) {
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Setup
 	proxyClassAllOpts := &tsapi.ProxyClass{
 		Spec: tsapi.ProxyClassSpec{
 			StatefulSet: &tsapi.StatefulSet{
-				Labels:      map[string]string{"foo": "bar"},
+				Labels:      tsapi.Labels{"foo": "bar"},
 				Annotations: map[string]string{"foo.io/bar": "foo"},
 				Pod: &tsapi.Pod{
-					Labels:      map[string]string{"bar": "foo"},
+					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsUser: ptr.To(int64(0)),
@@ -66,7 +72,18 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 					ImagePullSecrets: []corev1.LocalObjectReference{{Name: "docker-creds"}},
 					NodeName:         "some-node",
 					NodeSelector:     map[string]string{"beta.kubernetes.io/os": "linux"},
+					Affinity:         &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{}}},
 					Tolerations:      []corev1.Toleration{{Key: "", Operator: "Exists"}},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
+						{
+							WhenUnsatisfiable: "DoNotSchedule",
+							TopologyKey:       "kubernetes.io/hostname",
+							MaxSkew:           3,
+							LabelSelector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{"foo": "bar"},
+							},
+						},
+					},
 					TailscaleContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
 							Privileged: ptr.To(true),
@@ -75,6 +92,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
 							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
 						},
+						Env:             []tsapi.Env{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}},
+						ImagePullPolicy: "IfNotPresent",
+						Image:           "ghcr.io/my-repo/tailscale:v0.01testsomething",
 					},
 					TailscaleInitContainer: &tsapi.Container{
 						SecurityContext: &corev1.SecurityContext{
@@ -85,6 +105,9 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 							Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1000m"), corev1.ResourceMemory: resource.MustParse("128Mi")},
 							Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("64Mi")},
 						},
+						Env:             []tsapi.Env{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}},
+						ImagePullPolicy: "IfNotPresent",
+						Image:           "ghcr.io/my-repo/tailscale:v0.01testsomething",
 					},
 				},
 			},
@@ -93,14 +116,35 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	proxyClassJustLabels := &tsapi.ProxyClass{
 		Spec: tsapi.ProxyClassSpec{
 			StatefulSet: &tsapi.StatefulSet{
-				Labels:      map[string]string{"foo": "bar"},
+				Labels:      tsapi.Labels{"foo": "bar"},
 				Annotations: map[string]string{"foo.io/bar": "foo"},
 				Pod: &tsapi.Pod{
-					Labels:      map[string]string{"bar": "foo"},
+					Labels:      tsapi.Labels{"bar": "foo"},
 					Annotations: map[string]string{"bar.io/foo": "foo"},
 				},
 			},
 		},
+	}
+
+	proxyClassWithMetricsDebug := func(metrics bool, debug *bool) *tsapi.ProxyClass {
+		return &tsapi.ProxyClass{
+			Spec: tsapi.ProxyClassSpec{
+				Metrics: &tsapi.Metrics{Enable: metrics},
+				StatefulSet: func() *tsapi.StatefulSet {
+					if debug == nil {
+						return nil
+					}
+
+					return &tsapi.StatefulSet{
+						Pod: &tsapi.Pod{
+							TailscaleContainer: &tsapi.Container{
+								Debug: &tsapi.Debug{Enable: *debug},
+							},
+						},
+					}
+				}(),
+			},
+		}
 	}
 	var userspaceProxySS, nonUserspaceProxySS appsv1.StatefulSet
 	if err := yaml.Unmarshal(userspaceProxyYaml, &userspaceProxySS); err != nil {
@@ -121,83 +165,132 @@ func Test_applyProxyClassToStatefulSet(t *testing.T) {
 	env := []corev1.EnvVar{{Name: "TS_HOSTNAME", Value: "nginx"}}
 	userspaceProxySS.Labels = labels
 	userspaceProxySS.Annotations = annots
+	userspaceProxySS.Spec.Template.Spec.Containers[0].Image = "tailscale/tailscale:v0.0.1"
 	userspaceProxySS.Spec.Template.Spec.Containers[0].Env = env
 	nonUserspaceProxySS.ObjectMeta.Labels = labels
 	nonUserspaceProxySS.ObjectMeta.Annotations = annots
 	nonUserspaceProxySS.Spec.Template.Spec.Containers[0].Env = env
+	nonUserspaceProxySS.Spec.Template.Spec.InitContainers[0].Image = "tailscale/tailscale:v0.0.1"
 
 	// 1. Test that a ProxyClass with all fields set gets correctly applied
 	// to a Statefulset built from non-userspace proxy template.
 	wantSS := nonUserspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassAllOpts.Spec.StatefulSet.Pod.Annotations
 	wantSS.Spec.Template.Spec.SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.SecurityContext
 	wantSS.Spec.Template.Spec.ImagePullSecrets = proxyClassAllOpts.Spec.StatefulSet.Pod.ImagePullSecrets
 	wantSS.Spec.Template.Spec.NodeName = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeName
 	wantSS.Spec.Template.Spec.NodeSelector = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeSelector
+	wantSS.Spec.Template.Spec.Affinity = proxyClassAllOpts.Spec.StatefulSet.Pod.Affinity
 	wantSS.Spec.Template.Spec.Tolerations = proxyClassAllOpts.Spec.StatefulSet.Pod.Tolerations
+	wantSS.Spec.Template.Spec.TopologySpreadConstraints = proxyClassAllOpts.Spec.StatefulSet.Pod.TopologySpreadConstraints
 	wantSS.Spec.Template.Spec.Containers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.SecurityContext
 	wantSS.Spec.Template.Spec.InitContainers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleInitContainer.SecurityContext
 	wantSS.Spec.Template.Spec.Containers[0].Resources = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.Resources
 	wantSS.Spec.Template.Spec.InitContainers[0].Resources = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleInitContainer.Resources
+	wantSS.Spec.Template.Spec.InitContainers[0].Env = append(wantSS.Spec.Template.Spec.InitContainers[0].Env, []corev1.EnvVar{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}}...)
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env, []corev1.EnvVar{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}}...)
+	wantSS.Spec.Template.Spec.Containers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
+	wantSS.Spec.Template.Spec.Containers[0].ImagePullPolicy = "IfNotPresent"
+	wantSS.Spec.Template.Spec.InitContainers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
+	wantSS.Spec.Template.Spec.InitContainers[0].ImagePullPolicy = "IfNotPresent"
 
-	gotSS := applyProxyClassToStatefulSet(proxyClassAllOpts, nonUserspaceProxySS.DeepCopy())
+	gotSS := applyProxyClassToStatefulSet(proxyClassAllOpts, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with all fields set to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with all fields set to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 2. Test that a ProxyClass with custom labels and annotations for
 	// StatefulSet and Pod set gets correctly applied to a Statefulset built
 	// from non-userspace proxy template.
 	wantSS = nonUserspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
-	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, nonUserspaceProxySS.DeepCopy())
+	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for non-userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 3. Test that a ProxyClass with all fields set gets correctly applied
 	// to a Statefulset built from a userspace proxy template.
 	wantSS = userspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassAllOpts.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassAllOpts.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassAllOpts.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassAllOpts.Spec.StatefulSet.Pod.Annotations
 	wantSS.Spec.Template.Spec.SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.SecurityContext
 	wantSS.Spec.Template.Spec.ImagePullSecrets = proxyClassAllOpts.Spec.StatefulSet.Pod.ImagePullSecrets
 	wantSS.Spec.Template.Spec.NodeName = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeName
 	wantSS.Spec.Template.Spec.NodeSelector = proxyClassAllOpts.Spec.StatefulSet.Pod.NodeSelector
+	wantSS.Spec.Template.Spec.Affinity = proxyClassAllOpts.Spec.StatefulSet.Pod.Affinity
 	wantSS.Spec.Template.Spec.Tolerations = proxyClassAllOpts.Spec.StatefulSet.Pod.Tolerations
+	wantSS.Spec.Template.Spec.TopologySpreadConstraints = proxyClassAllOpts.Spec.StatefulSet.Pod.TopologySpreadConstraints
 	wantSS.Spec.Template.Spec.Containers[0].SecurityContext = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.SecurityContext
 	wantSS.Spec.Template.Spec.Containers[0].Resources = proxyClassAllOpts.Spec.StatefulSet.Pod.TailscaleContainer.Resources
-	gotSS = applyProxyClassToStatefulSet(proxyClassAllOpts, userspaceProxySS.DeepCopy())
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env, []corev1.EnvVar{{Name: "foo", Value: "bar"}, {Name: "TS_USERSPACE", Value: "true"}, {Name: "bar"}}...)
+	wantSS.Spec.Template.Spec.Containers[0].ImagePullPolicy = "IfNotPresent"
+	wantSS.Spec.Template.Spec.Containers[0].Image = "ghcr.io/my-repo/tailscale:v0.01testsomething"
+	gotSS = applyProxyClassToStatefulSet(proxyClassAllOpts, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with all options to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
 	}
 
 	// 4. Test that a ProxyClass with custom labels and annotations gets correctly applied
 	// to a Statefulset built from a userspace proxy template.
 	wantSS = userspaceProxySS.DeepCopy()
-	wantSS.ObjectMeta.Labels = mergeMapKeys(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels)
-	wantSS.ObjectMeta.Annotations = mergeMapKeys(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
-	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels
+	updateMap(wantSS.ObjectMeta.Labels, proxyClassJustLabels.Spec.StatefulSet.Labels.Parse())
+	updateMap(wantSS.ObjectMeta.Annotations, proxyClassJustLabels.Spec.StatefulSet.Annotations)
+	wantSS.Spec.Template.Labels = proxyClassJustLabels.Spec.StatefulSet.Pod.Labels.Parse()
 	wantSS.Spec.Template.Annotations = proxyClassJustLabels.Spec.StatefulSet.Pod.Annotations
-	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, userspaceProxySS.DeepCopy())
+	gotSS = applyProxyClassToStatefulSet(proxyClassJustLabels, userspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
 	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
-		t.Fatalf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
+		t.Errorf("Unexpected result applying ProxyClass with custom labels and annotations to a StatefulSet for a userspace proxy (-got +want):\n%s", diff)
 	}
-}
 
-func mergeMapKeys(a, b map[string]string) map[string]string {
-	for key, val := range b {
-		a[key] = val
+	// 5. Metrics enabled defaults to enabling both metrics and debug.
+	wantSS = nonUserspaceProxySS.DeepCopy()
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_DEBUG_ADDR_PORT", Value: "$(POD_IP):9001"},
+		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
+		corev1.EnvVar{Name: "TS_LOCAL_ADDR_PORT", Value: "$(POD_IP):9002"},
+		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{
+		{Name: "debug", Protocol: "TCP", ContainerPort: 9001},
+		{Name: "metrics", Protocol: "TCP", ContainerPort: 9002},
 	}
-	return a
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, nil), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+	}
+
+	// 6. Enable _just_ metrics by explicitly disabling debug.
+	wantSS = nonUserspaceProxySS.DeepCopy()
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_LOCAL_ADDR_PORT", Value: "$(POD_IP):9002"},
+		corev1.EnvVar{Name: "TS_ENABLE_METRICS", Value: "true"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "metrics", Protocol: "TCP", ContainerPort: 9002}}
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(true, ptr.To(false)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+	}
+
+	// 7. Enable _just_ debug without metrics.
+	wantSS = nonUserspaceProxySS.DeepCopy()
+	wantSS.Spec.Template.Spec.Containers[0].Env = append(wantSS.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "TS_DEBUG_ADDR_PORT", Value: "$(POD_IP):9001"},
+		corev1.EnvVar{Name: "TS_TAILSCALED_EXTRA_ARGS", Value: "--debug=$(TS_DEBUG_ADDR_PORT)"},
+	)
+	wantSS.Spec.Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "debug", Protocol: "TCP", ContainerPort: 9001}}
+	gotSS = applyProxyClassToStatefulSet(proxyClassWithMetricsDebug(false, ptr.To(true)), nonUserspaceProxySS.DeepCopy(), new(tailscaleSTSConfig), zl.Sugar())
+	if diff := cmp.Diff(gotSS, wantSS); diff != "" {
+		t.Errorf("Unexpected result applying ProxyClass with metrics enabled to a StatefulSet (-got +want):\n%s", diff)
+	}
 }
 
 func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
@@ -289,5 +382,12 @@ func Test_mergeStatefulSetLabelsOrAnnots(t *testing.T) {
 				t.Errorf("mergeStatefulSetLabels() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// updateMap updates map a with the values from map b.
+func updateMap(a, b map[string]string) {
+	for key, val := range b {
+		a[key] = val
 	}
 }

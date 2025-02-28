@@ -28,6 +28,7 @@ import (
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/version"
 )
 
@@ -110,10 +111,10 @@ func newServeV2Command(e *serveEnv, subcmd serveMode) *ffcli.Command {
 		Name:      info.Name,
 		ShortHelp: info.ShortHelp,
 		ShortUsage: strings.Join([]string{
-			fmt.Sprintf("%s <target>", info.Name),
-			fmt.Sprintf("%s status [--json]", info.Name),
-			fmt.Sprintf("%s reset", info.Name),
-		}, "\n  "),
+			fmt.Sprintf("tailscale %s <target>", info.Name),
+			fmt.Sprintf("tailscale %s status [--json]", info.Name),
+			fmt.Sprintf("tailscale %s reset", info.Name),
+		}, "\n"),
 		LongHelp: info.LongHelp + fmt.Sprintf(strings.TrimSpace(serveHelpCommon), info.Name),
 		Exec:     e.runServeCombined(subcmd),
 
@@ -131,20 +132,20 @@ func newServeV2Command(e *serveEnv, subcmd serveMode) *ffcli.Command {
 		UsageFunc: usageFuncNoDefaultValues,
 		Subcommands: []*ffcli.Command{
 			{
-				Name:      "status",
-				Exec:      e.runServeStatus,
-				ShortHelp: "view current proxy configuration",
+				Name:       "status",
+				ShortUsage: "tailscale " + info.Name + " status [--json]",
+				Exec:       e.runServeStatus,
+				ShortHelp:  "View current " + info.Name + " configuration",
 				FlagSet: e.newFlags("serve-status", func(fs *flag.FlagSet) {
 					fs.BoolVar(&e.json, "json", false, "output JSON")
 				}),
-				UsageFunc: usageFunc,
 			},
 			{
-				Name:      "reset",
-				ShortHelp: "reset current serve/funnel config",
-				Exec:      e.runServeReset,
-				FlagSet:   e.newFlags("serve-reset", nil),
-				UsageFunc: usageFunc,
+				Name:       "reset",
+				ShortUsage: "tailscale " + info.Name + " reset",
+				ShortHelp:  "Reset current " + info.Name + " config",
+				Exec:       e.runServeReset,
+				FlagSet:    e.newFlags("serve-reset", nil),
 			},
 		},
 	}
@@ -439,11 +440,7 @@ func (e *serveEnv) messageForPort(sc *ipn.ServeConfig, st *ipnstate.Status, dnsN
 	}
 
 	if sc.Web[hp] != nil {
-		var mounts []string
-
-		for k := range sc.Web[hp].Handlers {
-			mounts = append(mounts, k)
-		}
+		mounts := slicesx.MapKeys(sc.Web[hp].Handlers)
 		sort.Slice(mounts, func(i, j int) bool {
 			return len(mounts[i]) < len(mounts[j])
 		})
@@ -497,9 +494,9 @@ func (e *serveEnv) applyWebServe(sc *ipn.ServeConfig, dnsName string, srvPort ui
 		}
 		h.Text = text
 	case filepath.IsAbs(target):
-		if version.IsSandboxedMacOS() {
-			// don't allow path serving for now on macOS (2022-11-15)
-			return errors.New("path serving is not supported if sandboxed on macOS")
+		if version.IsMacAppStore() || version.IsMacSys() {
+			// The Tailscale network extension cannot serve arbitrary paths on macOS due to sandbox restrictions (2024-03-26)
+			return errors.New("Path serving is not supported on macOS due to sandbox restrictions. To use Tailscale Serve on macOS, switch to the open-source tailscaled distribution. See https://tailscale.com/kb/1065/macos-variants for more information.")
 		}
 
 		target = filepath.Clean(target)
@@ -823,12 +820,12 @@ func (e *serveEnv) stdout() io.Writer {
 	if e.testStdout != nil {
 		return e.testStdout
 	}
-	return os.Stdout
+	return Stdout
 }
 
 func (e *serveEnv) stderr() io.Writer {
 	if e.testStderr != nil {
 		return e.testStderr
 	}
-	return os.Stderr
+	return Stderr
 }

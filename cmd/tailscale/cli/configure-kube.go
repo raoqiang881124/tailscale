@@ -20,30 +20,41 @@ import (
 	"tailscale.com/version"
 )
 
-func init() {
-	configureCmd.Subcommands = append(configureCmd.Subcommands, configureKubeconfigCmd)
-}
-
-var configureKubeconfigCmd = &ffcli.Command{
-	Name:       "kubeconfig",
-	ShortHelp:  "[ALPHA] Connect to a Kubernetes cluster using a Tailscale Auth Proxy",
-	ShortUsage: "kubeconfig <hostname-or-fqdn>",
-	LongHelp: strings.TrimSpace(`
+func configureKubeconfigCmd() *ffcli.Command {
+	return &ffcli.Command{
+		Name:       "kubeconfig",
+		ShortHelp:  "[ALPHA] Connect to a Kubernetes cluster using a Tailscale Auth Proxy",
+		ShortUsage: "tailscale configure kubeconfig <hostname-or-fqdn>",
+		LongHelp: strings.TrimSpace(`
 Run this command to configure kubectl to connect to a Kubernetes cluster over Tailscale.
 
 The hostname argument should be set to the Tailscale hostname of the peer running as an auth proxy in the cluster.
 
 See: https://tailscale.com/s/k8s-auth-proxy
 `),
-	FlagSet: (func() *flag.FlagSet {
-		fs := newFlagSet("kubeconfig")
-		return fs
-	})(),
-	Exec: runConfigureKubeconfig,
+		FlagSet: (func() *flag.FlagSet {
+			fs := newFlagSet("kubeconfig")
+			return fs
+		})(),
+		Exec: runConfigureKubeconfig,
+	}
 }
 
 // kubeconfigPath returns the path to the kubeconfig file for the current user.
-func kubeconfigPath() string {
+func kubeconfigPath() (string, error) {
+	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+		if version.IsSandboxedMacOS() {
+			return "", errors.New("cannot read $KUBECONFIG on GUI builds of the macOS client: this requires the open-source tailscaled distribution")
+		}
+		var out string
+		for _, out = range filepath.SplitList(kubeconfig) {
+			if info, err := os.Stat(out); !os.IsNotExist(err) && !info.IsDir() {
+				break
+			}
+		}
+		return out, nil
+	}
+
 	var dir string
 	if version.IsSandboxedMacOS() {
 		// The HOME environment variable in macOS sandboxed apps is set to
@@ -55,7 +66,7 @@ func kubeconfigPath() string {
 	} else {
 		dir = homedir.HomeDir()
 	}
-	return filepath.Join(dir, ".kube", "config")
+	return filepath.Join(dir, ".kube", "config"), nil
 }
 
 func runConfigureKubeconfig(ctx context.Context, args []string) error {
@@ -76,7 +87,11 @@ func runConfigureKubeconfig(ctx context.Context, args []string) error {
 		return fmt.Errorf("no peer found with hostname %q", hostOrFQDN)
 	}
 	targetFQDN = strings.TrimSuffix(targetFQDN, ".")
-	if err := setKubeconfigForPeer(targetFQDN, kubeconfigPath()); err != nil {
+	var kubeconfig string
+	if kubeconfig, err = kubeconfigPath(); err != nil {
+		return err
+	}
+	if err = setKubeconfigForPeer(targetFQDN, kubeconfig); err != nil {
 		return err
 	}
 	printf("kubeconfig configured for %q\n", hostOrFQDN)
@@ -119,7 +134,7 @@ func updateKubeconfig(cfgYaml []byte, fqdn string) ([]byte, error) {
 
 	var clusters []any
 	if cm, ok := cfg["clusters"]; ok {
-		clusters = cm.([]any)
+		clusters, _ = cm.([]any)
 	}
 	cfg["clusters"] = appendOrSetNamed(clusters, fqdn, map[string]any{
 		"name": fqdn,
@@ -130,7 +145,7 @@ func updateKubeconfig(cfgYaml []byte, fqdn string) ([]byte, error) {
 
 	var users []any
 	if um, ok := cfg["users"]; ok {
-		users = um.([]any)
+		users, _ = um.([]any)
 	}
 	cfg["users"] = appendOrSetNamed(users, "tailscale-auth", map[string]any{
 		// We just need one of these, and can reuse it for all clusters.
@@ -144,7 +159,7 @@ func updateKubeconfig(cfgYaml []byte, fqdn string) ([]byte, error) {
 
 	var contexts []any
 	if cm, ok := cfg["contexts"]; ok {
-		contexts = cm.([]any)
+		contexts, _ = cm.([]any)
 	}
 	cfg["contexts"] = appendOrSetNamed(contexts, fqdn, map[string]any{
 		"name": fqdn,

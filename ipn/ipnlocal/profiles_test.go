@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"tailscale.com/clientupdate"
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
@@ -23,7 +25,7 @@ import (
 func TestProfileCurrentUserSwitch(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,25 +52,25 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 	pm.SetCurrentUserID("user1")
 	newProfile(t, "user1")
 	cp := pm.currentProfile
-	pm.DeleteProfile(cp.ID)
-	if pm.currentProfile == nil {
+	pm.DeleteProfile(cp.ID())
+	if !pm.currentProfile.Valid() {
 		t.Fatal("currentProfile is nil")
-	} else if pm.currentProfile.ID != "" {
-		t.Fatalf("currentProfile.ID = %q, want empty", pm.currentProfile.ID)
+	} else if pm.currentProfile.ID() != "" {
+		t.Fatalf("currentProfile.ID = %q, want empty", pm.currentProfile.ID())
 	}
 	if !pm.CurrentPrefs().Equals(defaultPrefs) {
 		t.Fatalf("CurrentPrefs() = %v, want emptyPrefs", pm.CurrentPrefs().Pretty())
 	}
 
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
 	pm.SetCurrentUserID("user1")
-	if pm.currentProfile == nil {
+	if !pm.currentProfile.Valid() {
 		t.Fatal("currentProfile is nil")
-	} else if pm.currentProfile.ID != "" {
-		t.Fatalf("currentProfile.ID = %q, want empty", pm.currentProfile.ID)
+	} else if pm.currentProfile.ID() != "" {
+		t.Fatalf("currentProfile.ID = %q, want empty", pm.currentProfile.ID())
 	}
 	if !pm.CurrentPrefs().Equals(defaultPrefs) {
 		t.Fatalf("CurrentPrefs() = %v, want emptyPrefs", pm.CurrentPrefs().Pretty())
@@ -78,7 +80,7 @@ func TestProfileCurrentUserSwitch(t *testing.T) {
 func TestProfileList(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +110,8 @@ func TestProfileList(t *testing.T) {
 			t.Fatalf("got %d profiles, want %d", len(got), len(want))
 		}
 		for i, w := range want {
-			if got[i].Name != w {
-				t.Errorf("got profile %d name %q, want %q", i, got[i].Name, w)
+			if got[i].Name() != w {
+				t.Errorf("got profile %d name %q, want %q", i, got[i].Name(), w)
 			}
 		}
 	}
@@ -127,10 +129,10 @@ func TestProfileList(t *testing.T) {
 
 	pm.SetCurrentUserID("user1")
 	checkProfiles(t, "alice", "bob")
-	if lp := pm.findProfileByKey(carol.Key); lp != nil {
+	if lp := pm.findProfileByKey("user1", carol.Key()); lp.Valid() {
 		t.Fatalf("found profile for user2 in user1's profile list")
 	}
-	if lp := pm.findProfileByName(carol.Name); lp != nil {
+	if lp := pm.findProfileByName("user1", carol.Name()); lp.Valid() {
 		t.Fatalf("found profile for user2 in user1's profile list")
 	}
 
@@ -282,7 +284,7 @@ func TestProfileDupe(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			store := new(mem.Store)
-			pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
+			pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -292,7 +294,7 @@ func TestProfileDupe(t *testing.T) {
 			profs := pm.Profiles()
 			var got []*persist.Persist
 			for _, p := range profs {
-				prefs, err := pm.loadSavedPrefs(p.Key)
+				prefs, err := pm.loadSavedPrefs(p.Key())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -315,7 +317,7 @@ func TestProfileDupe(t *testing.T) {
 func TestProfileManagement(t *testing.T) {
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,9 +328,9 @@ func TestProfileManagement(t *testing.T) {
 	checkProfiles := func(t *testing.T) {
 		t.Helper()
 		prof := pm.CurrentProfile()
-		t.Logf("\tCurrentProfile = %q", prof)
-		if prof.Name != wantCurProfile {
-			t.Fatalf("CurrentProfile = %q; want %q", prof, wantCurProfile)
+		t.Logf("\tCurrentProfile = %q", prof.Name())
+		if prof.Name() != wantCurProfile {
+			t.Fatalf("CurrentProfile = %q; want %q", prof.Name(), wantCurProfile)
 		}
 		profiles := pm.Profiles()
 		wantLen := len(wantProfiles)
@@ -339,6 +341,7 @@ func TestProfileManagement(t *testing.T) {
 			t.Fatalf("Profiles = %v; want %v", profiles, wantProfiles)
 		}
 		p := pm.CurrentPrefs()
+		t.Logf("\tCurrentPrefs = %s", p.Pretty())
 		if !p.Valid() {
 			t.Fatalf("CurrentPrefs = %v; want valid", p)
 		}
@@ -346,13 +349,13 @@ func TestProfileManagement(t *testing.T) {
 			t.Fatalf("CurrentPrefs = %v; want %v", p.Pretty(), wantProfiles[wantCurProfile].Pretty())
 		}
 		for _, p := range profiles {
-			got, err := pm.loadSavedPrefs(p.Key)
+			got, err := pm.loadSavedPrefs(p.Key())
 			if err != nil {
 				t.Fatal(err)
 			}
 			// Use Hostname as a proxy for all prefs.
-			if !got.Equals(wantProfiles[p.Name]) {
-				t.Fatalf("Prefs for profile %q =\n got=%+v\nwant=%v", p, got.Pretty(), wantProfiles[p.Name].Pretty())
+			if !got.Equals(wantProfiles[p.Name()]) {
+				t.Fatalf("Prefs for profile %q =\n got=%+v\nwant=%v", p.Name(), got.Pretty(), wantProfiles[p.Name()].Pretty())
 			}
 		}
 	}
@@ -412,14 +415,14 @@ func TestProfileManagement(t *testing.T) {
 	t.Logf("Recreate profile manager from store")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkProfiles(t)
 
 	t.Logf("Delete default profile")
-	if err := pm.DeleteProfile(pm.findProfileByName("user@1.example.com").ID); err != nil {
+	if err := pm.DeleteProfile(pm.ProfileIDForName("user@1.example.com")); err != nil {
 		t.Fatal(err)
 	}
 	delete(wantProfiles, "user@1.example.com")
@@ -428,7 +431,7 @@ func TestProfileManagement(t *testing.T) {
 	t.Logf("Recreate profile manager from store after deleting default profile")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, "linux")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,6 +461,27 @@ func TestProfileManagement(t *testing.T) {
 	delete(wantProfiles, "tagged-node.2.ts.net")
 	wantCurProfile = "user@2.example.com"
 	checkProfiles(t)
+
+	if !clientupdate.CanAutoUpdate() {
+		t.Logf("Save an invalid AutoUpdate pref value")
+		prefs := pm.CurrentPrefs().AsStruct()
+		prefs.AutoUpdate.Apply.Set(true)
+		if err := pm.SetPrefs(prefs.View(), ipn.NetworkProfile{}); err != nil {
+			t.Fatal(err)
+		}
+		if !pm.CurrentPrefs().AutoUpdate().Apply.EqualBool(true) {
+			t.Fatal("SetPrefs failed to save auto-update setting")
+		}
+		// Re-load profiles to trigger migration for invalid auto-update value.
+		pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "linux")
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkProfiles(t)
+		if pm.CurrentPrefs().AutoUpdate().Apply.EqualBool(true) {
+			t.Fatal("invalid auto-update setting persisted after reload")
+		}
+	}
 }
 
 // TestProfileManagementWindows tests going into and out of Unattended mode on
@@ -471,7 +495,7 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	store := new(mem.Store)
 
-	pm, err := newProfileManagerWithGOOS(store, logger.Discard, "windows")
+	pm, err := newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,9 +506,9 @@ func TestProfileManagementWindows(t *testing.T) {
 	checkProfiles := func(t *testing.T) {
 		t.Helper()
 		prof := pm.CurrentProfile()
-		t.Logf("\tCurrentProfile = %q", prof)
-		if prof.Name != wantCurProfile {
-			t.Fatalf("CurrentProfile = %q; want %q", prof, wantCurProfile)
+		t.Logf("\tCurrentProfile = %q", prof.Name())
+		if prof.Name() != wantCurProfile {
+			t.Fatalf("CurrentProfile = %q; want %q", prof.Name(), wantCurProfile)
 		}
 		if p := pm.CurrentPrefs(); !p.Equals(wantProfiles[wantCurProfile]) {
 			t.Fatalf("CurrentPrefs = %+v; want %+v", p.Pretty(), wantProfiles[wantCurProfile].Pretty())
@@ -516,9 +540,7 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	{
 		t.Logf("Set user1 as logged in user")
-		if err := pm.SetCurrentUserID(uid); err != nil {
-			t.Fatalf("can't set user id: %s", err)
-		}
+		pm.SetCurrentUserID(uid)
 		checkProfiles(t)
 		t.Logf("Save prefs for user1")
 		wantProfiles["default"] = setPrefs(t, "default", false)
@@ -542,7 +564,7 @@ func TestProfileManagementWindows(t *testing.T) {
 	t.Logf("Recreate profile manager from store, should reset prefs")
 	// Recreate the profile manager to ensure that it can load the profiles
 	// from the store at startup.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, "windows")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,9 +574,7 @@ func TestProfileManagementWindows(t *testing.T) {
 
 	{
 		t.Logf("Set user1 as current user")
-		if err := pm.SetCurrentUserID(uid); err != nil {
-			t.Fatal(err)
-		}
+		pm.SetCurrentUserID(uid)
 		wantCurProfile = "test"
 	}
 	checkProfiles(t)
@@ -567,12 +587,25 @@ func TestProfileManagementWindows(t *testing.T) {
 	}
 
 	// Recreate the profile manager to ensure that it starts with test profile.
-	pm, err = newProfileManagerWithGOOS(store, logger.Discard, "windows")
+	pm, err = newProfileManagerWithGOOS(store, logger.Discard, new(health.Tracker), "windows")
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkProfiles(t)
 	if pm.CurrentUserID() != uid {
 		t.Fatalf("CurrentUserID = %q; want %q", pm.CurrentUserID(), uid)
+	}
+}
+
+// TestDefaultPrefs tests that defaultPrefs is just NewPrefs with
+// LoggedOut=true (the Prefs we use before connecting to control). We shouldn't
+// be putting any defaulting there, and instead put all defaults in NewPrefs.
+func TestDefaultPrefs(t *testing.T) {
+	p1 := ipn.NewPrefs()
+	p1.LoggedOut = true
+	p1.WantRunning = false
+	p2 := defaultPrefs
+	if !p1.View().Equals(p2) {
+		t.Errorf("defaultPrefs is %s, want %s; defaultPrefs should only modify WantRunning and LoggedOut, all other defaults should be in ipn.NewPrefs.", p2.Pretty(), p1.Pretty())
 	}
 }

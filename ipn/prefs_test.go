@@ -26,7 +26,7 @@ import (
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -38,9 +38,9 @@ func TestPrefsEqual(t *testing.T) {
 	prefsHandles := []string{
 		"ControlURL",
 		"RouteAll",
-		"AllowSingleHosts",
 		"ExitNodeID",
 		"ExitNodeIP",
+		"InternalExitNodePrior",
 		"ExitNodeAllowLANAccess",
 		"CorpDNS",
 		"RunSSH",
@@ -54,7 +54,9 @@ func TestPrefsEqual(t *testing.T) {
 		"ForceDaemon",
 		"Egg",
 		"AdvertiseRoutes",
+		"AdvertiseServices",
 		"NoSNAT",
+		"NoStatefulFiltering",
 		"NetfilterMode",
 		"OperatorUser",
 		"ProfileName",
@@ -62,6 +64,8 @@ func TestPrefsEqual(t *testing.T) {
 		"AppConnector",
 		"PostureChecking",
 		"NetfilterKind",
+		"DriveShares",
+		"AllowSingleHosts",
 		"Persist",
 	}
 	if have := fieldsOf(reflect.TypeFor[Prefs]()); !reflect.DeepEqual(have, prefsHandles) {
@@ -120,18 +124,6 @@ func TestPrefsEqual(t *testing.T) {
 			&Prefs{RouteAll: true},
 			true,
 		},
-
-		{
-			&Prefs{AllowSingleHosts: true},
-			&Prefs{AllowSingleHosts: false},
-			false,
-		},
-		{
-			&Prefs{AllowSingleHosts: true},
-			&Prefs{AllowSingleHosts: true},
-			true,
-		},
-
 		{
 			&Prefs{ExitNodeID: "n1234"},
 			&Prefs{},
@@ -339,6 +331,16 @@ func TestPrefsEqual(t *testing.T) {
 			&Prefs{NetfilterKind: ""},
 			false,
 		},
+		{
+			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:xenia"}},
+			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:xenia"}},
+			true,
+		},
+		{
+			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:xenia"}},
+			&Prefs{AdvertiseServices: []string{"svc:tux", "svc:amelie"}},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equals(tt.b)
@@ -370,9 +372,10 @@ func checkPrefs(t *testing.T, p Prefs) {
 	if p.Equals(p2) {
 		t.Fatalf("p == p2\n")
 	}
-	p2b, err = PrefsFromBytes(p2.ToBytes())
+	p2b = new(Prefs)
+	err = PrefsFromBytes(p2.ToBytes(), p2b)
 	if err != nil {
-		t.Fatalf("PrefsFromBytes(p2) failed\n")
+		t.Fatalf("PrefsFromBytes(p2) failed: bytes=%q; err=%v\n", p2.ToBytes(), err)
 	}
 	p2p := p2.Pretty()
 	p2bp := p2b.Pretty()
@@ -423,56 +426,46 @@ func TestPrefsPretty(t *testing.T) {
 		{
 			Prefs{},
 			"linux",
-			"Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}",
+			"Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist=nil}",
 		},
 		{
 			Prefs{},
 			"windows",
-			"Prefs{ra=false mesh=false dns=false want=false update=off Persist=nil}",
+			"Prefs{ra=false dns=false want=false update=off Persist=nil}",
 		},
 		{
 			Prefs{ShieldsUp: true},
 			"windows",
-			"Prefs{ra=false mesh=false dns=false want=false shields=true update=off Persist=nil}",
+			"Prefs{ra=false dns=false want=false shields=true update=off Persist=nil}",
 		},
 		{
-			Prefs{AllowSingleHosts: true},
+			Prefs{},
 			"windows",
 			"Prefs{ra=false dns=false want=false update=off Persist=nil}",
 		},
 		{
 			Prefs{
-				NotepadURLs:      true,
-				AllowSingleHosts: true,
+				NotepadURLs: true,
 			},
 			"windows",
 			"Prefs{ra=false dns=false want=false notepad=true update=off Persist=nil}",
 		},
 		{
 			Prefs{
-				AllowSingleHosts: true,
-				WantRunning:      true,
-				ForceDaemon:      true, // server mode
+				WantRunning: true,
+				ForceDaemon: true, // server mode
 			},
 			"windows",
 			"Prefs{ra=false dns=false want=true server=true update=off Persist=nil}",
 		},
 		{
 			Prefs{
-				AllowSingleHosts: true,
-				WantRunning:      true,
-				ControlURL:       "http://localhost:1234",
-				AdvertiseTags:    []string{"tag:foo", "tag:bar"},
+				WantRunning:   true,
+				ControlURL:    "http://localhost:1234",
+				AdvertiseTags: []string{"tag:foo", "tag:bar"},
 			},
 			"darwin",
 			`Prefs{ra=false dns=false want=true tags=tag:foo,tag:bar url="http://localhost:1234" update=off Persist=nil}`,
-		},
-		{
-			Prefs{
-				Persist: &persist.Persist{},
-			},
-			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist{lm=, o=, n= u=""}}`,
 		},
 		{
 			Prefs{
@@ -481,21 +474,21 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist{lm=, o=, n=[B1VKl] u=""}}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist{o=, n=[B1VKl] u=""}}`,
 		},
 		{
 			Prefs{
 				ExitNodeIP: netip.MustParseAddr("1.2.3.4"),
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false exit=1.2.3.4 lan=false routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false exit=1.2.3.4 lan=false routes=[] nf=off update=off Persist=nil}`,
 		},
 		{
 			Prefs{
 				ExitNodeID: tailcfg.StableNodeID("myNodeABC"),
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false exit=myNodeABC lan=false routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false exit=myNodeABC lan=false routes=[] nf=off update=off Persist=nil}`,
 		},
 		{
 			Prefs{
@@ -503,21 +496,21 @@ func TestPrefsPretty(t *testing.T) {
 				ExitNodeAllowLANAccess: true,
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false exit=myNodeABC lan=true routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false exit=myNodeABC lan=true routes=[] nf=off update=off Persist=nil}`,
 		},
 		{
 			Prefs{
 				ExitNodeAllowLANAccess: true,
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
 		},
 		{
 			Prefs{
 				Hostname: "foo",
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off host="foo" update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off host="foo" update=off Persist=nil}`,
 		},
 		{
 			Prefs{
@@ -527,7 +520,7 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=check Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=check Persist=nil}`,
 		},
 		{
 			Prefs{
@@ -537,7 +530,7 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=on Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=on Persist=nil}`,
 		},
 		{
 			Prefs{
@@ -546,7 +539,7 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off appconnector=advertise Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off appconnector=advertise Persist=nil}`,
 		},
 		{
 			Prefs{
@@ -555,21 +548,21 @@ func TestPrefsPretty(t *testing.T) {
 				},
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
 		},
 		{
 			Prefs{
 				NetfilterKind: "iptables",
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off netfilterKind=iptables update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off netfilterKind=iptables update=off Persist=nil}`,
 		},
 		{
 			Prefs{
 				NetfilterKind: "",
 			},
 			"linux",
-			`Prefs{ra=false mesh=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
+			`Prefs{ra=false dns=false want=false routes=[] nf=off update=off Persist=nil}`,
 		},
 	}
 	for i, tt := range tests {
@@ -583,7 +576,7 @@ func TestPrefsPretty(t *testing.T) {
 func TestLoadPrefsNotExist(t *testing.T) {
 	bogusFile := fmt.Sprintf("/tmp/not-exist-%d", time.Now().UnixNano())
 
-	p, err := LoadPrefs(bogusFile)
+	p, err := LoadPrefsWindows(bogusFile)
 	if errors.Is(err, os.ErrNotExist) {
 		// expected.
 		return
@@ -605,7 +598,7 @@ func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
 	f.Close()
 	defer os.Remove(path)
 
-	p, err := LoadPrefs(path)
+	p, err := LoadPrefsWindows(path)
 	if errors.Is(err, os.ErrNotExist) {
 		// expected.
 		return
@@ -613,11 +606,25 @@ func TestLoadPrefsFileWithZeroInIt(t *testing.T) {
 	t.Fatalf("unexpected prefs=%#v, err=%v", p, err)
 }
 
+func TestMaskedPrefsSetsInternal(t *testing.T) {
+	for _, f := range fieldsOf(reflect.TypeFor[MaskedPrefs]()) {
+		if !strings.HasSuffix(f, "Set") || !strings.HasPrefix(f, "Internal") {
+			continue
+		}
+		mp := new(MaskedPrefs)
+		reflect.ValueOf(mp).Elem().FieldByName(f).SetBool(true)
+		if !mp.SetsInternal() {
+			t.Errorf("MaskedPrefs.%sSet=true but SetsInternal=false", f)
+		}
+	}
+}
+
 func TestMaskedPrefsFields(t *testing.T) {
 	have := map[string]bool{}
 	for _, f := range fieldsOf(reflect.TypeFor[Prefs]()) {
-		if f == "Persist" {
-			// This one can't be edited.
+		switch f {
+		case "Persist", "AllowSingleHosts":
+			// These can't be edited.
 			continue
 		}
 		have[f] = true
@@ -646,7 +653,7 @@ func TestMaskedPrefsFields(t *testing.T) {
 	// ApplyEdits assumes.
 	pt := reflect.TypeFor[Prefs]()
 	mt := reflect.TypeFor[MaskedPrefs]()
-	for i := 0; i < mt.NumField(); i++ {
+	for i := range mt.NumField() {
 		name := mt.Field(i).Name
 		if i == 0 {
 			if name != "Prefs" {
@@ -736,13 +743,12 @@ func TestMaskedPrefsPretty(t *testing.T) {
 		{
 			m: &MaskedPrefs{
 				Prefs: Prefs{
-					Hostname:         "bar",
-					OperatorUser:     "galaxybrain",
-					AllowSingleHosts: true,
-					RouteAll:         false,
-					ExitNodeID:       "foo",
-					AdvertiseTags:    []string{"tag:foo", "tag:bar"},
-					NetfilterMode:    preftype.NetfilterNoDivert,
+					Hostname:      "bar",
+					OperatorUser:  "galaxybrain",
+					RouteAll:      false,
+					ExitNodeID:    "foo",
+					AdvertiseTags: []string{"tag:foo", "tag:bar"},
+					NetfilterMode: preftype.NetfilterNoDivert,
 				},
 				RouteAllSet:      true,
 				HostnameSet:      true,
@@ -913,6 +919,21 @@ func TestExitNodeIPOfArg(t *testing.T) {
 			want: mustIP("1.0.0.2"),
 		},
 		{
+			name: "name_fqdn",
+			arg:  "skippy.foo.",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:        "skippy.foo.",
+						TailscaleIPs:   []netip.Addr{mustIP("1.0.0.2")},
+						ExitNodeOption: true,
+					},
+				},
+			},
+			want: mustIP("1.0.0.2"),
+		},
+		{
 			name: "name_not_exit",
 			arg:  "skippy",
 			st: &ipnstate.Status{
@@ -925,6 +946,20 @@ func TestExitNodeIPOfArg(t *testing.T) {
 				},
 			},
 			wantErr: `node "skippy" is not advertising an exit node`,
+		},
+		{
+			name: "name_wrong_fqdn",
+			arg:  "skippy.bar.",
+			st: &ipnstate.Status{
+				MagicDNSSuffix: ".foo",
+				Peer: map[key.NodePublic]*ipnstate.PeerStatus{
+					key.NewNode().Public(): {
+						DNSName:      "skippy.foo.",
+						TailscaleIPs: []netip.Addr{mustIP("1.0.0.2")},
+					},
+				},
+			},
+			wantErr: `invalid value "skippy.bar." for --exit-node; must be IP or unique node name`,
 		},
 		{
 			name: "ambiguous",
@@ -1045,5 +1080,26 @@ func TestNotifyPrefsJSONRoundtrip(t *testing.T) {
 	}
 	if n2.Prefs != nil && n2.Prefs.Valid() {
 		t.Fatal("Prefs should not be valid after deserialization")
+	}
+}
+
+// Verify that our Prefs type writes out an AllowSingleHosts field so we can
+// downgrade to older versions that require it.
+func TestPrefsDowngrade(t *testing.T) {
+	var p Prefs
+	j, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type oldPrefs struct {
+		AllowSingleHosts bool
+	}
+	var op oldPrefs
+	if err := json.Unmarshal(j, &op); err != nil {
+		t.Fatal(err)
+	}
+	if !op.AllowSingleHosts {
+		t.Fatal("AllowSingleHosts should be true")
 	}
 }

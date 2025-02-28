@@ -70,7 +70,7 @@ func TestRateLimiter(t *testing.T) {
 	lgtest := logTester(want, t, &testsRun)
 	lg := RateLimitedFnWithClock(lgtest, 1*time.Minute, 2, 50, nowf)
 	var prefixed Logf
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		lg("boring string with constant formatting %s", "(constant)")
 		lg("templated format string no. %d", i)
 		if i == 4 {
@@ -121,7 +121,7 @@ func TestLogOnChange(t *testing.T) {
 	lgtest := logTester(want, t, &testsRun)
 	lg := LogOnChange(lgtest, 5*time.Second, timeNow)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		lg("%s", "1 2 3 4 5 6")
 	}
 	lg("1 2 3 4 5 7")
@@ -256,5 +256,25 @@ func TestAsJSON(t *testing.T) {
 		// to happen at some point to get to fmt, so might
 		// as well return an interface from AsJSON))
 		t.Errorf("allocs = %v; want max 2", n)
+	}
+}
+
+func TestHTTPServerLogFilter(t *testing.T) {
+	var buf bytes.Buffer
+	logf := func(format string, args ...any) {
+		t.Logf("[logf] "+format, args...)
+		fmt.Fprintf(&buf, format, args...)
+	}
+
+	lf := HTTPServerLogFilter{logf}
+	quietLogger := log.New(lf, "", 0)
+
+	quietLogger.Printf("foo bar")
+	quietLogger.Printf("http: TLS handshake error from %s:%d: EOF", "1.2.3.4", 9999)
+	quietLogger.Printf("baz")
+
+	const want = "foo bar\nbaz\n"
+	if s := buf.String(); s != want {
+		t.Errorf("got buf=%q, want %q", s, want)
 	}
 }

@@ -4,6 +4,7 @@
 package localapi
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -81,7 +82,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 		client *http.Client = http.DefaultClient
 	)
 	checkConn := func(derpNode *tailcfg.DERPNode) bool {
-		port := firstNonzero(derpNode.DERPPort, 443)
+		port := cmp.Or(derpNode.DERPPort, 443)
 
 		var (
 			hasIPv4 bool
@@ -89,7 +90,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 		)
 
 		// Check IPv4 first
-		addr := net.JoinHostPort(firstNonzero(derpNode.IPv4, derpNode.HostName), strconv.Itoa(port))
+		addr := net.JoinHostPort(cmp.Or(derpNode.IPv4, derpNode.HostName), strconv.Itoa(port))
 		conn, err := dialer.DialContext(ctx, "tcp4", addr)
 		if err != nil {
 			st.Errors = append(st.Errors, fmt.Sprintf("Error connecting to node %q @ %q over IPv4: %v", derpNode.HostName, addr, err))
@@ -98,7 +99,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 
 			// Upgrade to TLS and verify that works properly.
 			tlsConn := tls.Client(conn, &tls.Config{
-				ServerName: firstNonzero(derpNode.CertName, derpNode.HostName),
+				ServerName: cmp.Or(derpNode.CertName, derpNode.HostName),
 			})
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				st.Errors = append(st.Errors, fmt.Sprintf("Error upgrading connection to node %q @ %q to TLS over IPv4: %v", derpNode.HostName, addr, err))
@@ -108,7 +109,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check IPv6
-		addr = net.JoinHostPort(firstNonzero(derpNode.IPv6, derpNode.HostName), strconv.Itoa(port))
+		addr = net.JoinHostPort(cmp.Or(derpNode.IPv6, derpNode.HostName), strconv.Itoa(port))
 		conn, err = dialer.DialContext(ctx, "tcp6", addr)
 		if err != nil {
 			st.Errors = append(st.Errors, fmt.Sprintf("Error connecting to node %q @ %q over IPv6: %v", derpNode.HostName, addr, err))
@@ -117,7 +118,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 
 			// Upgrade to TLS and verify that works properly.
 			tlsConn := tls.Client(conn, &tls.Config{
-				ServerName: firstNonzero(derpNode.CertName, derpNode.HostName),
+				ServerName: cmp.Or(derpNode.CertName, derpNode.HostName),
 				// TODO(andrew-d): we should print more
 				// detailed failure information on if/why TLS
 				// verification fails
@@ -140,7 +141,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	checkSTUN4 := func(derpNode *tailcfg.DERPNode) {
-		u4, err := nettype.MakePacketListenerWithNetIP(netns.Listener(h.logf, h.netMon)).ListenPacket(ctx, "udp4", ":0")
+		u4, err := nettype.MakePacketListenerWithNetIP(netns.Listener(h.logf, h.b.NetMon())).ListenPacket(ctx, "udp4", ":0")
 		if err != nil {
 			st.Errors = append(st.Errors, fmt.Sprintf("Error creating IPv4 STUN listener: %v", err))
 			return
@@ -166,7 +167,7 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 			addr = addrs[0]
 		}
 
-		addrPort := netip.AddrPortFrom(addr, uint16(firstNonzero(derpNode.STUNPort, 3478)))
+		addrPort := netip.AddrPortFrom(addr, uint16(cmp.Or(derpNode.STUNPort, 3478)))
 
 		txID := stun.NewTxID()
 		req := stun.Request(txID)
@@ -230,8 +231,14 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 		connSuccess := checkConn(derpNode)
 
 		// Verify that the /generate_204 endpoint works
-		captivePortalURL := "http://" + derpNode.HostName + "/generate_204"
-		resp, err := client.Get(captivePortalURL)
+		captivePortalURL := fmt.Sprintf("http://%s/generate_204?t=%d", derpNode.HostName, time.Now().Unix())
+		req, err := http.NewRequest("GET", captivePortalURL, nil)
+		if err != nil {
+			st.Warnings = append(st.Warnings, fmt.Sprintf("Internal error creating request for captive portal check: %v", err))
+			continue
+		}
+		req.Header.Set("Cache-Control", "no-cache, no-store, must-revalidate, no-transform, max-age=0")
+		resp, err := client.Do(req)
 		if err != nil {
 			st.Warnings = append(st.Warnings, fmt.Sprintf("Error making request to the captive portal check %q; is port 80 blocked?", captivePortalURL))
 		} else {
@@ -247,9 +254,9 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 		// Next, repeatedly get the server key to see if the node is
 		// behind a load balancer (incorrectly).
 		serverPubKeys := make(map[key.NodePublic]bool)
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			func() {
-				rc := derphttp.NewRegionClient(fakePrivKey, h.logf, h.netMon, func() *tailcfg.DERPRegion {
+				rc := derphttp.NewRegionClient(fakePrivKey, h.logf, h.b.NetMon(), func() *tailcfg.DERPRegion {
 					return &tailcfg.DERPRegion{
 						RegionID:   reg.RegionID,
 						RegionCode: reg.RegionCode,
@@ -291,14 +298,4 @@ func (h *Handler) serveDebugDERPRegion(w http.ResponseWriter, r *http.Request) {
 	// * If their certificate is bad, either expired or just wrongly
 	//   issued in the first place, tell them specifically that the
 	// 	 cert is bad not just that the connection failed.
-}
-
-func firstNonzero[T comparable](items ...T) T {
-	var zero T
-	for _, item := range items {
-		if item != zero {
-			return item
-		}
-	}
-	return zero
 }

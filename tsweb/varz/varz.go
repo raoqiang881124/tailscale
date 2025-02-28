@@ -10,22 +10,29 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	_ "net/http/pprof"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"tailscale.com/metrics"
 	"tailscale.com/version"
 )
 
+// StaticStringVar returns a new expvar.Var that always returns s.
+func StaticStringVar(s string) expvar.Var {
+	var v any = s // box s into an interface just once
+	return expvar.Func(func() any { return v })
+}
+
 func init() {
 	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() any { return version.Long() }))
-	expvar.Publish("go_version", expvar.Func(func() any { return runtime.Version() }))
+	expvar.Publish("version", StaticStringVar(version.Long()))
+	expvar.Publish("go_version", StaticStringVar(runtime.Version()))
 	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
 	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
@@ -85,8 +92,29 @@ func prometheusMetric(prefix string, key string) (string, string, string) {
 			label, key = a, b
 		}
 	}
+
+	// Convert the metric to a valid Prometheus metric name.
+	// "Metric names may contain ASCII letters, digits, underscores, and colons.
+	// It must match the regex [a-zA-Z_:][a-zA-Z0-9_:]*"
+	mapInvalidMetricRunes := func(r rune) rune {
+		if r >= 'a' && r <= 'z' ||
+			r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' ||
+			r == '_' || r == ':' {
+			return r
+		}
+		if r < utf8.RuneSelf && unicode.IsPrint(r) {
+			return '_'
+		}
+		return -1
+	}
+	metricName := strings.Map(mapInvalidMetricRunes, prefix+key)
+	if metricName == "" || unicode.IsDigit(rune(metricName[0])) {
+		metricName = "_" + metricName
+	}
+
 	d := &prometheusMetricDetails{
-		Name:  strings.ReplaceAll(prefix+key, "-", "_"),
+		Name:  metricName,
 		Type:  typ,
 		Label: label,
 	}
@@ -109,6 +137,9 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 		v.Do(func(kv expvar.KeyValue) {
 			writePromExpVar(w, name+"_", kv)
 		})
+		return
+	case PrometheusWriter:
+		v.WritePrometheus(w, name)
 		return
 	case PrometheusMetricsReflectRooter:
 		root := v.PrometheusMetricsReflectRoot()
@@ -210,6 +241,14 @@ func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
 	}
 }
 
+// PrometheusWriter is the interface implemented by metrics that can write
+// themselves into Prometheus exposition format.
+//
+// As of 2024-03-25, this is only *metrics.MultiLabelMap.
+type PrometheusWriter interface {
+	WritePrometheus(w io.Writer, name string)
+}
+
 var sortedKVsPool = &sync.Pool{New: func() any { return new(sortedKVs) }}
 
 // sortedKV is a KeyValue with a sort key.
@@ -240,19 +279,28 @@ type sortedKVs struct {
 //
 // This will evolve over time, or perhaps be replaced.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	ExpvarDoHandler(expvarDo)(w, r)
+}
 
-	s := sortedKVsPool.Get().(*sortedKVs)
-	defer sortedKVsPool.Put(s)
-	s.kvs = s.kvs[:0]
-	expvarDo(func(kv expvar.KeyValue) {
-		s.kvs = append(s.kvs, sortedKV{kv, removeTypePrefixes(kv.Key)})
-	})
-	sort.Slice(s.kvs, func(i, j int) bool {
-		return s.kvs[i].sortKey < s.kvs[j].sortKey
-	})
-	for _, e := range s.kvs {
-		writePromExpVar(w, "", e.KeyValue)
+// ExpvarDoHandler handler returns a Handler like above, but takes an optional
+// expvar.Do func allow the usage of alternative containers of metrics, other
+// than the global expvar.Map.
+func ExpvarDoHandler(expvarDoFunc func(f func(expvar.KeyValue))) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain;version=0.0.4;charset=utf-8")
+
+		s := sortedKVsPool.Get().(*sortedKVs)
+		defer sortedKVsPool.Put(s)
+		s.kvs = s.kvs[:0]
+		expvarDoFunc(func(kv expvar.KeyValue) {
+			s.kvs = append(s.kvs, sortedKV{kv, removeTypePrefixes(kv.Key)})
+		})
+		sort.Slice(s.kvs, func(i, j int) bool {
+			return s.kvs[i].sortKey < s.kvs[j].sortKey
+		})
+		for _, e := range s.kvs {
+			writePromExpVar(w, "", e.KeyValue)
+		}
 	}
 }
 

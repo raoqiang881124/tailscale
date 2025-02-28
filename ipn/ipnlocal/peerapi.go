@@ -17,39 +17,39 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/kortschak/wol"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
+	"tailscale.com/drive"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netaddr"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
 	"tailscale.com/taildrop"
-	"tailscale.com/tailfs"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httphdr"
+	"tailscale.com/util/httpm"
 	"tailscale.com/wgengine/filter"
 )
 
 const (
-	tailFSPrefix = "/v0/tailfs"
+	taildrivePrefix = "/v0/drive"
 )
 
-var initListenConfig func(*net.ListenConfig, netip.Addr, *interfaces.State, string) error
+var initListenConfig func(*net.ListenConfig, netip.Addr, *netmon.State, string) error
 
 // addH2C is non-nil on platforms where we want to add H2C
 // ("cleartext" HTTP/2) support to the peerAPI.
@@ -67,7 +67,7 @@ type peerAPIServer struct {
 	taildrop *taildrop.Manager
 }
 
-func (s *peerAPIServer) listen(ip netip.Addr, ifState *interfaces.State) (ln net.Listener, err error) {
+func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
 	// Android for whatever reason often has problems creating the peerapi listener.
 	// But since we started intercepting it with netstack, it's not even important that
 	// we have a real kernel-level listener. So just create a dummy listener on Android
@@ -185,7 +185,7 @@ func (pln *peerAPIListener) serve() {
 
 func (pln *peerAPIListener) ServeConn(src netip.AddrPort, c net.Conn) {
 	logf := pln.lb.logf
-	peerNode, peerUser, ok := pln.lb.WhoIs(src)
+	peerNode, peerUser, ok := pln.lb.WhoIs("tcp", src)
 	if !ok {
 		logf("peerapi: unknown peer %v", src)
 		c.Close()
@@ -224,6 +224,23 @@ type peerAPIHandler struct {
 	peerUser   tailcfg.UserProfile // profile of peerNode
 }
 
+// PeerAPIHandler is the interface implemented by [peerAPIHandler] and needed by
+// module features registered via tailscale.com/feature/*.
+type PeerAPIHandler interface {
+	Peer() tailcfg.NodeView
+	PeerCaps() tailcfg.PeerCapMap
+	Self() tailcfg.NodeView
+	LocalBackend() *LocalBackend
+	IsSelfUntagged() bool // whether the peer is untagged and the same as this user
+}
+
+func (h *peerAPIHandler) IsSelfUntagged() bool {
+	return !h.selfNode.IsTagged() && !h.peerNode.IsTagged() && h.isSelf
+}
+func (h *peerAPIHandler) Peer() tailcfg.NodeView      { return h.peerNode }
+func (h *peerAPIHandler) Self() tailcfg.NodeView      { return h.selfNode }
+func (h *peerAPIHandler) LocalBackend() *LocalBackend { return h.ps.b }
+
 func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
 }
@@ -231,11 +248,13 @@ func (h *peerAPIHandler) logf(format string, a ...any) {
 // isAddressValid reports whether addr is a valid destination address for this
 // node originating from the peer.
 func (h *peerAPIHandler) isAddressValid(addr netip.Addr) bool {
-	if v := h.peerNode.SelfNodeV4MasqAddrForThisPeer(); v != nil {
-		return *v == addr
+	if !addr.IsValid() {
+		return false
 	}
-	if v := h.peerNode.SelfNodeV6MasqAddrForThisPeer(); v != nil {
-		return *v == addr
+	v4MasqAddr, hasMasqV4 := h.peerNode.SelfNodeV4MasqAddrForThisPeer().GetOk()
+	v6MasqAddr, hasMasqV6 := h.peerNode.SelfNodeV6MasqAddrForThisPeer().GetOk()
+	if hasMasqV4 || hasMasqV6 {
+		return addr == v4MasqAddr || addr == v6MasqAddr
 	}
 	pfx := netip.PrefixFrom(addr, addr.BitLen())
 	return views.SliceContains(h.selfNode.Addresses(), pfx)
@@ -298,6 +317,20 @@ func peerAPIRequestShouldGetSecurityHeaders(r *http.Request) bool {
 	return false
 }
 
+// RegisterPeerAPIHandler registers a PeerAPI handler.
+//
+// The path should be of the form "/v0/foo".
+//
+// It panics if the path is already registered.
+func RegisterPeerAPIHandler(path string, f func(PeerAPIHandler, http.ResponseWriter, *http.Request)) {
+	if _, ok := peerAPIHandlers[path]; ok {
+		panic(fmt.Sprintf("duplicate PeerAPI handler %q", path))
+	}
+	peerAPIHandlers[path] = f
+}
+
+var peerAPIHandlers = map[string]func(PeerAPIHandler, http.ResponseWriter, *http.Request){} // by URL.Path
+
 func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := h.validatePeerAPIRequest(r); err != nil {
 		metricInvalidRequests.Add(1)
@@ -322,8 +355,8 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDNSQuery(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, tailFSPrefix) {
-		h.handleServeTailFS(w, r)
+	if strings.HasPrefix(r.URL.Path, taildrivePrefix) {
+		h.handleServeDrive(w, r)
 		return
 	}
 	switch r.URL.Path {
@@ -342,10 +375,6 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v0/dnsfwd":
 		h.handleServeDNSFwd(w, r)
 		return
-	case "/v0/wol":
-		metricWakeOnLANCalls.Add(1)
-		h.handleWakeOnLAN(w, r)
-		return
 	case "/v0/interfaces":
 		h.handleServeInterfaces(w, r)
 		return
@@ -358,6 +387,10 @@ func (h *peerAPIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/v0/ingress":
 		metricIngressCalls.Add(1)
 		h.handleServeIngress(w, r)
+		return
+	}
+	if ph, ok := peerAPIHandlers[r.URL.Path]; ok {
+		ph(h, w, r)
 		return
 	}
 	who := h.peerUser.DisplayName
@@ -442,19 +475,19 @@ func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Re
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintln(w, "<h1>Interfaces</h1>")
 
-	if dr, err := interfaces.DefaultRoute(); err == nil {
+	if dr, err := netmon.DefaultRoute(); err == nil {
 		fmt.Fprintf(w, "<h3>Default route is %q(%d)</h3>\n", html.EscapeString(dr.InterfaceName), dr.InterfaceIndex)
 	} else {
 		fmt.Fprintf(w, "<h3>Could not get the default route: %s</h3>\n", html.EscapeString(err.Error()))
 	}
 
-	if hasCGNATInterface, err := interfaces.HasCGNATInterface(); hasCGNATInterface {
+	if hasCGNATInterface, err := netmon.HasCGNATInterface(); hasCGNATInterface {
 		fmt.Fprintln(w, "<p>There is another interface using the CGNAT range.</p>")
 	} else if err != nil {
 		fmt.Fprintf(w, "<p>Could not check for CGNAT interfaces: %s</p>\n", html.EscapeString(err.Error()))
 	}
 
-	i, err := interfaces.GetList()
+	i, err := netmon.GetInterfaceList()
 	if err != nil {
 		fmt.Fprintf(w, "Could not get interfaces: %s\n", html.EscapeString(err.Error()))
 		return
@@ -466,12 +499,12 @@ func (h *peerAPIHandler) handleServeInterfaces(w http.ResponseWriter, r *http.Re
 		fmt.Fprintf(w, "<th>%v</th> ", v)
 	}
 	fmt.Fprint(w, "</tr>\n")
-	i.ForeachInterface(func(iface interfaces.Interface, ipps []netip.Prefix) {
+	i.ForeachInterface(func(iface netmon.Interface, ipps []netip.Prefix) {
 		fmt.Fprint(w, "<tr>")
 		for _, v := range []any{iface.Index, iface.Name, iface.MTU, iface.Flags, ipps} {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(fmt.Sprintf("%v", v)))
 		}
-		if extras, err := interfaces.InterfaceDebugExtras(iface.Index); err == nil && extras != "" {
+		if extras, err := netmon.InterfaceDebugExtras(iface.Index); err == nil && extras != "" {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(extras))
 		} else if err != nil {
 			fmt.Fprintf(w, "<td>%s</td> ", html.EscapeString(err.Error()))
@@ -620,14 +653,6 @@ func (h *peerAPIHandler) canDebug() bool {
 	return h.isSelf || h.peerHasCap(tailcfg.PeerCapabilityDebugPeer)
 }
 
-// canWakeOnLAN reports whether h can send a Wake-on-LAN packet from this node.
-func (h *peerAPIHandler) canWakeOnLAN() bool {
-	if h.peerNode.UnsignedPeerAPIOnly() {
-		return false
-	}
-	return h.isSelf || h.peerHasCap(tailcfg.PeerCapabilityWakeOnLAN)
-}
-
 var allowSelfIngress = envknob.RegisterBool("TS_ALLOW_SELF_INGRESS")
 
 // canIngress reports whether h can send ingress requests to this node.
@@ -636,10 +661,10 @@ func (h *peerAPIHandler) canIngress() bool {
 }
 
 func (h *peerAPIHandler) peerHasCap(wantCap tailcfg.PeerCapability) bool {
-	return h.peerCaps().HasCapability(wantCap)
+	return h.PeerCaps().HasCapability(wantCap)
 }
 
-func (h *peerAPIHandler) peerCaps() tailcfg.PeerCapMap {
+func (h *peerAPIHandler) PeerCaps() tailcfg.PeerCapMap {
 	return h.ps.b.PeerCaps(h.remoteAddr.Addr())
 }
 
@@ -813,61 +838,6 @@ func (h *peerAPIHandler) handleServeDNSFwd(w http.ResponseWriter, r *http.Reques
 	dh.ServeHTTP(w, r)
 }
 
-func (h *peerAPIHandler) handleWakeOnLAN(w http.ResponseWriter, r *http.Request) {
-	if !h.canWakeOnLAN() {
-		http.Error(w, "no WoL access", http.StatusForbidden)
-		return
-	}
-	if r.Method != "POST" {
-		http.Error(w, "bad method", http.StatusMethodNotAllowed)
-		return
-	}
-	macStr := r.FormValue("mac")
-	if macStr == "" {
-		http.Error(w, "missing 'mac' param", http.StatusBadRequest)
-		return
-	}
-	mac, err := net.ParseMAC(macStr)
-	if err != nil {
-		http.Error(w, "bad 'mac' param", http.StatusBadRequest)
-		return
-	}
-	var password []byte // TODO(bradfitz): support? does anything use WoL passwords?
-	st := h.ps.b.sys.NetMon.Get().InterfaceState()
-	if st == nil {
-		http.Error(w, "failed to get interfaces state", http.StatusInternalServerError)
-		return
-	}
-	var res struct {
-		SentTo []string
-		Errors []string
-	}
-	for ifName, ips := range st.InterfaceIPs {
-		for _, ip := range ips {
-			if ip.Addr().IsLoopback() || ip.Addr().Is6() {
-				continue
-			}
-			local := &net.UDPAddr{
-				IP:   ip.Addr().AsSlice(),
-				Port: 0,
-			}
-			remote := &net.UDPAddr{
-				IP:   net.IPv4bcast,
-				Port: 0,
-			}
-			if err := wol.Wake(mac, password, local, remote); err != nil {
-				res.Errors = append(res.Errors, err.Error())
-			} else {
-				res.SentTo = append(res.SentTo, ifName)
-			}
-			break // one per interface is enough
-		}
-	}
-	sort.Strings(res.SentTo)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
-}
-
 func (h *peerAPIHandler) replyToDNSQueries() bool {
 	if h.isSelf {
 		// If the peer is owned by the same user, just allow it
@@ -962,7 +932,11 @@ func (h *peerAPIHandler) handleDNSQuery(w http.ResponseWriter, r *http.Request) 
 	// instead to avoid re-parsing the DNS response for improved performance in
 	// the future.
 	if h.ps.b.OfferingAppConnector() {
-		h.ps.b.ObserveDNSResponse(res)
+		if err := h.ps.b.ObserveDNSResponse(res); err != nil {
+			h.logf("ObserveDNSResponse error: %v", err)
+			// This is not fatal, we probably just failed to parse the upstream
+			// response. Return it to the caller anyway.
+		}
 	}
 
 	if pretty {
@@ -1104,37 +1078,120 @@ func writePrettyDNSReply(w io.Writer, res []byte) (err error) {
 	return nil
 }
 
-func (h *peerAPIHandler) handleServeTailFS(w http.ResponseWriter, r *http.Request) {
-	if !h.ps.b.TailFSSharingEnabled() {
-		http.Error(w, "tailfs not enabled", http.StatusNotFound)
+// httpResponseWrapper wraps an http.ResponseWrite and
+// stores the status code and content length.
+type httpResponseWrapper struct {
+	http.ResponseWriter
+	statusCode    int
+	contentLength int64
+}
+
+// WriteHeader implements the WriteHeader interface.
+func (hrw *httpResponseWrapper) WriteHeader(status int) {
+	hrw.statusCode = status
+	hrw.ResponseWriter.WriteHeader(status)
+}
+
+// Write implements the Write interface.
+func (hrw *httpResponseWrapper) Write(b []byte) (int, error) {
+	n, err := hrw.ResponseWriter.Write(b)
+	hrw.contentLength += int64(n)
+	return n, err
+}
+
+// requestBodyWrapper wraps an io.ReadCloser and stores
+// the number of bytesRead.
+type requestBodyWrapper struct {
+	io.ReadCloser
+	bytesRead int64
+}
+
+// Read implements the io.Reader interface.
+func (rbw *requestBodyWrapper) Read(b []byte) (int, error) {
+	n, err := rbw.ReadCloser.Read(b)
+	rbw.bytesRead += int64(n)
+	return n, err
+}
+
+func (h *peerAPIHandler) handleServeDrive(w http.ResponseWriter, r *http.Request) {
+	if !h.ps.b.DriveSharingEnabled() {
+		h.logf("taildrive: not enabled")
+		http.Error(w, "taildrive not enabled", http.StatusNotFound)
 		return
 	}
 
-	capsMap := h.peerCaps()
-	tailfsCaps, ok := capsMap[tailcfg.PeerCapabilityTailFS]
+	capsMap := h.PeerCaps()
+	driveCaps, ok := capsMap[tailcfg.PeerCapabilityTaildrive]
 	if !ok {
-		http.Error(w, "tailfs not permitted", http.StatusForbidden)
+		h.logf("taildrive: not permitted")
+		http.Error(w, "taildrive not permitted", http.StatusForbidden)
 		return
 	}
 
-	rawPerms := make([][]byte, 0, len(tailfsCaps))
-	for _, cap := range tailfsCaps {
+	rawPerms := make([][]byte, 0, len(driveCaps))
+	for _, cap := range driveCaps {
 		rawPerms = append(rawPerms, []byte(cap))
 	}
 
-	p, err := tailfs.ParsePermissions(rawPerms)
+	p, err := drive.ParsePermissions(rawPerms)
 	if err != nil {
+		h.logf("taildrive: error parsing permissions: %w", err.Error())
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fs, ok := h.ps.b.sys.TailFSForRemote.GetOK()
+	fs, ok := h.ps.b.sys.DriveForRemote.GetOK()
 	if !ok {
-		http.Error(w, "tailfs not enabled", http.StatusNotFound)
+		h.logf("taildrive: not supported on platform")
+		http.Error(w, "taildrive not supported on platform", http.StatusNotFound)
 		return
 	}
-	r.URL.Path = strings.TrimPrefix(r.URL.Path, tailFSPrefix)
-	fs.ServeHTTPWithPerms(p, w, r)
+	wr := &httpResponseWrapper{
+		ResponseWriter: w,
+	}
+	bw := &requestBodyWrapper{
+		ReadCloser: r.Body,
+	}
+	r.Body = bw
+
+	if r.Method == httpm.PUT || r.Method == httpm.GET {
+		defer func() {
+			switch wr.statusCode {
+			case 304:
+				// 304s are particularly chatty so skip logging.
+			default:
+				contentType := "unknown"
+				if ct := wr.Header().Get("Content-Type"); ct != "" {
+					contentType = ct
+				}
+
+				h.logf("taildrive: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseDriveFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
+			}
+		}()
+	}
+
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, taildrivePrefix)
+	fs.ServeHTTPWithPerms(p, wr, r)
+}
+
+// parseDriveFileExtensionForLog parses the file extension, if available.
+// If a file extension is not present or parsable, the file extension is
+// set to "unknown". If the file extension contains a double quote, it is
+// replaced with "removed".
+// All whitespace is removed from a parsed file extension.
+// File extensions including the leading ., e.g. ".gif".
+func parseDriveFileExtensionForLog(path string) string {
+	fileExt := "unknown"
+	if fe := filepath.Ext(path); fe != "" {
+		if strings.Contains(fe, "\"") {
+			// Do not log include file extensions with quotes within them.
+			return "removed"
+		}
+		// Remove white space from user defined inputs.
+		fileExt = strings.ReplaceAll(fe, " ", "")
+	}
+
+	return fileExt
 }
 
 // newFakePeerAPIListener creates a new net.Listener that acts like
@@ -1187,8 +1244,7 @@ var (
 	metricInvalidRequests = clientmetric.NewCounter("peerapi_invalid_requests")
 
 	// Non-debug PeerAPI endpoints.
-	metricPutCalls       = clientmetric.NewCounter("peerapi_put")
-	metricDNSCalls       = clientmetric.NewCounter("peerapi_dns")
-	metricWakeOnLANCalls = clientmetric.NewCounter("peerapi_wol")
-	metricIngressCalls   = clientmetric.NewCounter("peerapi_ingress")
+	metricPutCalls     = clientmetric.NewCounter("peerapi_put")
+	metricDNSCalls     = clientmetric.NewCounter("peerapi_dns")
+	metricIngressCalls = clientmetric.NewCounter("peerapi_ingress")
 )

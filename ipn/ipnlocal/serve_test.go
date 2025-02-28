@@ -24,10 +24,13 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/health"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
+	"tailscale.com/tstest"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/util/mak"
@@ -248,6 +251,14 @@ func TestServeConfigForeground(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Introduce a race between [LocalBackend] sending notifications
+	// and [LocalBackend.WatchNotifications] shutting down due to
+	// setting the serve config below.
+	const N = 1000
+	for range N {
+		go b.send(ipn.Notify{})
+	}
+
 	// Setting a new serve config should shut down WatchNotifications
 	// whose session IDs are no longer found: session1 goes, session2 stays.
 	err = b.SetServeConfig(&ipn.ServeConfig{
@@ -283,6 +294,203 @@ func TestServeConfigForeground(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting on second session")
 	}
+}
+
+// TestServeConfigServices tests the side effects of setting the
+// Services field in a ServeConfig. The Services field is a map
+// of all services the current service host is serving. Unlike what we
+// serve for node itself, there is no foreground and no local handlers
+// for the services. So the only things we need to test are if the
+// services configured are valid and if they correctly set intercept
+// functions for netStack.
+func TestServeConfigServices(t *testing.T) {
+	b := newTestBackend(t)
+	svcIPMap := tailcfg.ServiceIPMappings{
+		"svc:foo": []netip.Addr{
+			netip.MustParseAddr("100.101.101.101"),
+			netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:6565:6565"),
+		},
+		"svc:bar": []netip.Addr{
+			netip.MustParseAddr("100.99.99.99"),
+			netip.MustParseAddr("fd7a:115c:a1e0:ab12:4843:cd96:626b:628b"),
+		},
+	}
+	svcIPMapJSON, err := json.Marshal(svcIPMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b.netMap = &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			CapMap: tailcfg.NodeCapMap{
+				tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+			},
+		}).View(),
+		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
+			tailcfg.UserID(1): (&tailcfg.UserProfile{
+				LoginName:     "someone@example.com",
+				DisplayName:   "Some One",
+				ProfilePicURL: "https://example.com/photo.jpg",
+			}).View(),
+		},
+	}
+
+	tests := []struct {
+		name              string
+		conf              *ipn.ServeConfig
+		expectedErr       error
+		packetDstAddrPort []netip.AddrPort
+		intercepted       bool
+	}{
+		{
+			name: "no-services",
+			conf: &ipn.ServeConfig{},
+			packetDstAddrPort: []netip.AddrPort{
+				netip.MustParseAddrPort("100.101.101.101:443"),
+			},
+			intercepted: false,
+		},
+		{
+			name: "one-incorrectly-configured-service",
+			conf: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+						},
+						Tun: true,
+					},
+				},
+			},
+			expectedErr: ipn.ErrServiceConfigHasBothTCPAndTun,
+		},
+		{
+			// one correctly configured service with packet should be intercepted
+			name: "one-service-intercept-packet",
+			conf: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+						},
+					},
+				},
+			},
+			packetDstAddrPort: []netip.AddrPort{
+				netip.MustParseAddrPort("100.101.101.101:80"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:6565:6565]:80"),
+			},
+			intercepted: true,
+		},
+		{
+			// one correctly configured service with packet should not be intercepted
+			name: "one-service-not-intercept-packet",
+			conf: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+						},
+					},
+				},
+			},
+			packetDstAddrPort: []netip.AddrPort{
+				netip.MustParseAddrPort("100.99.99.99:80"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80"),
+				netip.MustParseAddrPort("100.101.101.101:82"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:6565:6565]:82"),
+			},
+			intercepted: false,
+		},
+		{
+			// multiple correctly configured service with packet should be intercepted
+			name: "multiple-service-intercept-packet",
+			conf: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+						},
+					},
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+							82: {HTTPS: true},
+						},
+					},
+				},
+			},
+			packetDstAddrPort: []netip.AddrPort{
+				netip.MustParseAddrPort("100.99.99.99:80"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:80"),
+				netip.MustParseAddrPort("100.101.101.101:81"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:6565:6565]:81"),
+			},
+			intercepted: true,
+		},
+		{
+			// multiple correctly configured service with packet should not be intercepted
+			name: "multiple-service-not-intercept-packet",
+			conf: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:foo": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+						},
+					},
+					"svc:bar": {
+						TCP: map[uint16]*ipn.TCPPortHandler{
+							80: {HTTP: true},
+							81: {HTTPS: true},
+							82: {HTTPS: true},
+						},
+					},
+				},
+			},
+			packetDstAddrPort: []netip.AddrPort{
+				// ips in capmap but port is not hosting service
+				netip.MustParseAddrPort("100.99.99.99:77"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:626b:628b]:77"),
+				netip.MustParseAddrPort("100.101.101.101:85"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:6565:6565]:85"),
+				// ips not in capmap
+				netip.MustParseAddrPort("100.102.102.102:80"),
+				netip.MustParseAddrPort("[fd7a:115c:a1e0:ab12:4843:cd96:6666:6666]:80"),
+			},
+			intercepted: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := b.SetServeConfig(tt.conf, "")
+			if err != nil && tt.expectedErr != nil {
+				if !errors.Is(err, tt.expectedErr) {
+					t.Fatalf("expected error %v,\n got %v", tt.expectedErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, addrPort := range tt.packetDstAddrPort {
+				if tt.intercepted != b.ShouldInterceptVIPServiceTCPPort(addrPort) {
+					if tt.intercepted {
+						t.Fatalf("expected packet to be intercepted")
+					} else {
+						t.Fatalf("expected packet not to be intercepted")
+					}
+				}
+			}
+		})
+	}
+
 }
 
 func TestServeConfigETag(t *testing.T) {
@@ -663,14 +871,25 @@ func mustCreateURL(t *testing.T, u string) url.URL {
 }
 
 func newTestBackend(t *testing.T) *LocalBackend {
+	var logf logger.Logf = logger.Discard
+	const debug = true
+	if debug {
+		logf = logger.WithPrefix(tstest.WhileTestRunningLogger(t), "... ")
+	}
+
 	sys := &tsd.System{}
-	e, err := wgengine.NewUserspaceEngine(t.Logf, wgengine.Config{SetSubsystem: sys.Set})
+	e, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
+		SetSubsystem:  sys.Set,
+		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sys.Set(e)
 	sys.Set(new(mem.Store))
-	b, err := NewLocalBackend(t.Logf, logid.PublicID{}, sys, 0)
+
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,21 +897,20 @@ func newTestBackend(t *testing.T) *LocalBackend {
 	dir := t.TempDir()
 	b.SetVarRoot(dir)
 
-	pm := must.Get(newProfileManager(new(mem.Store), t.Logf))
-	pm.currentProfile = &ipn.LoginProfile{ID: "id0"}
+	pm := must.Get(newProfileManager(new(mem.Store), logf, new(health.Tracker)))
+	pm.currentProfile = (&ipn.LoginProfile{ID: "id0"}).View()
 	b.pm = pm
 
 	b.netMap = &netmap.NetworkMap{
 		SelfNode: (&tailcfg.Node{
-			Name:         "example.ts.net",
-			Capabilities: []tailcfg.NodeCapability{tailcfg.NodeAttrsTailFSAccess},
+			Name: "example.ts.net",
 		}).View(),
-		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfile{
-			tailcfg.UserID(1): {
+		UserProfiles: map[tailcfg.UserID]tailcfg.UserProfileView{
+			tailcfg.UserID(1): (&tailcfg.UserProfile{
 				LoginName:     "someone@example.com",
 				DisplayName:   "Some One",
 				ProfilePicURL: "https://example.com/photo.jpg",
-			},
+			}).View(),
 		},
 	}
 	b.peers = map[tailcfg.NodeID]tailcfg.NodeView{
@@ -821,6 +1039,24 @@ func Test_isGRPCContentType(t *testing.T) {
 	for _, tt := range tests {
 		if got := isGRPCContentType(tt.contentType); got != tt.want {
 			t.Errorf("isGRPCContentType(%q) = %v, want %v", tt.contentType, got, tt.want)
+		}
+	}
+}
+
+func TestEncTailscaleHeaderValue(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"Alice Smith", "Alice Smith"},
+		{"Bad\xffUTF-8", ""},
+		{"Krūmiņa", "=?utf-8?q?Kr=C5=ABmi=C5=86a?="},
+	}
+	for _, tt := range tests {
+		got := encTailscaleHeaderValue(tt.in)
+		if got != tt.want {
+			t.Errorf("encTailscaleHeaderValue(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/slicesx"
 	"tailscale.com/version"
 )
 
@@ -44,13 +45,13 @@ func newServeLegacyCommand(e *serveEnv) *ffcli.Command {
 		Name:      "serve",
 		ShortHelp: "Serve content and local servers",
 		ShortUsage: strings.Join([]string{
-			"serve http:<port> <mount-point> <source> [off]",
-			"serve https:<port> <mount-point> <source> [off]",
-			"serve tcp:<port> tcp://localhost:<local-port> [off]",
-			"serve tls-terminated-tcp:<port> tcp://localhost:<local-port> [off]",
-			"serve status [--json]",
-			"serve reset",
-		}, "\n  "),
+			"tailscale serve http:<port> <mount-point> <source> [off]",
+			"tailscale serve https:<port> <mount-point> <source> [off]",
+			"tailscale serve tcp:<port> tcp://localhost:<local-port> [off]",
+			"tailscale serve tls-terminated-tcp:<port> tcp://localhost:<local-port> [off]",
+			"tailscale serve status [--json]",
+			"tailscale serve reset",
+		}, "\n"),
 		LongHelp: strings.TrimSpace(`
 *** BETA; all of this is subject to change ***
 
@@ -91,24 +92,21 @@ EXAMPLES
     local plaintext server on port 80:
     $ tailscale serve tls-terminated-tcp:443 tcp://localhost:80
 `),
-		Exec:      e.runServe,
-		UsageFunc: usageFunc,
+		Exec: e.runServe,
 		Subcommands: []*ffcli.Command{
 			{
 				Name:      "status",
 				Exec:      e.runServeStatus,
-				ShortHelp: "show current serve/funnel status",
+				ShortHelp: "Show current serve/funnel status",
 				FlagSet: e.newFlags("serve-status", func(fs *flag.FlagSet) {
 					fs.BoolVar(&e.json, "json", false, "output JSON")
 				}),
-				UsageFunc: usageFunc,
 			},
 			{
 				Name:      "reset",
 				Exec:      e.runServeReset,
-				ShortHelp: "reset current serve/funnel config",
+				ShortHelp: "Reset current serve/funnel config",
 				FlagSet:   e.newFlags("serve-reset", nil),
-				UsageFunc: usageFunc,
 			},
 		},
 	}
@@ -132,7 +130,7 @@ func (e *serveEnv) newFlags(name string, setup func(fs *flag.FlagSet)) *flag.Fla
 }
 
 // localServeClient is an interface conforming to the subset of
-// tailscale.LocalClient. It includes only the methods used by the
+// local.Client. It includes only the methods used by the
 // serve command.
 //
 // The purpose of this interface is to allow tests to provide a mock.
@@ -197,7 +195,7 @@ func (e *serveEnv) getLocalClientStatusWithoutPeers(ctx context.Context) (*ipnst
 	}
 	description, ok := isRunningOrStarting(st)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "%s\n", description)
+		fmt.Fprintf(Stderr, "%s\n", description)
 		os.Exit(1)
 	}
 	if st.Self == nil {
@@ -251,7 +249,7 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 	turnOff := "off" == args[len(args)-1]
 
 	if len(args) < 2 || ((srcType == "https" || srcType == "http") && !turnOff && len(args) < 3) {
-		fmt.Fprintf(os.Stderr, "error: invalid number of arguments\n\n")
+		fmt.Fprintf(Stderr, "error: invalid number of arguments\n\n")
 		return errHelp
 	}
 
@@ -290,8 +288,8 @@ func (e *serveEnv) runServe(ctx context.Context, args []string) error {
 		}
 		return e.handleTCPServe(ctx, srcType, srcPort, args[1])
 	default:
-		fmt.Fprintf(os.Stderr, "error: invalid serve type %q\n", srcType)
-		fmt.Fprint(os.Stderr, "must be one of: http:<port>, https:<port>, tcp:<port> or tls-terminated-tcp:<port>\n\n", srcType)
+		fmt.Fprintf(Stderr, "error: invalid serve type %q\n", srcType)
+		fmt.Fprint(Stderr, "must be one of: http:<port>, https:<port>, tcp:<port> or tls-terminated-tcp:<port>\n\n", srcType)
 		return errHelp
 	}
 }
@@ -327,13 +325,13 @@ func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, useTLS bo
 			return fmt.Errorf("path serving is not supported if sandboxed on macOS")
 		}
 		if !filepath.IsAbs(source) {
-			fmt.Fprintf(os.Stderr, "error: path must be absolute\n\n")
+			fmt.Fprintf(Stderr, "error: path must be absolute\n\n")
 			return errHelp
 		}
 		source = filepath.Clean(source)
 		fi, err := os.Stat(source)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: invalid path: %v\n\n", err)
+			fmt.Fprintf(Stderr, "error: invalid path: %v\n\n", err)
 			return errHelp
 		}
 		if fi.IsDir() && !strings.HasSuffix(mount, "/") {
@@ -357,7 +355,7 @@ func (e *serveEnv) handleWebServe(ctx context.Context, srvPort uint16, useTLS bo
 		return err
 	}
 	if sc.IsTCPForwardingOnPort(srvPort) {
-		fmt.Fprintf(os.Stderr, "error: cannot serve web; already serving TCP\n")
+		fmt.Fprintf(Stderr, "error: cannot serve web; already serving TCP\n")
 		return errHelp
 	}
 
@@ -390,7 +388,7 @@ func isProxyTarget(source string) bool {
 // allNumeric reports whether s only comprises of digits
 // and has at least one digit.
 func allNumeric(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
@@ -512,18 +510,18 @@ func (e *serveEnv) handleTCPServe(ctx context.Context, srcType string, srcPort u
 	case "tls-terminated-tcp":
 		terminateTLS = true
 	default:
-		fmt.Fprintf(os.Stderr, "error: invalid TCP source %q\n\n", dest)
+		fmt.Fprintf(Stderr, "error: invalid TCP source %q\n\n", dest)
 		return errHelp
 	}
 
 	dstURL, err := url.Parse(dest)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid TCP source %q: %v\n\n", dest, err)
+		fmt.Fprintf(Stderr, "error: invalid TCP source %q: %v\n\n", dest, err)
 		return errHelp
 	}
 	host, dstPortStr, err := net.SplitHostPort(dstURL.Host)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid TCP source %q: %v\n\n", dest, err)
+		fmt.Fprintf(Stderr, "error: invalid TCP source %q: %v\n\n", dest, err)
 		return errHelp
 	}
 
@@ -531,13 +529,13 @@ func (e *serveEnv) handleTCPServe(ctx context.Context, srcType string, srcPort u
 	case "localhost", "127.0.0.1":
 		// ok
 	default:
-		fmt.Fprintf(os.Stderr, "error: invalid TCP source %q\n", dest)
-		fmt.Fprint(os.Stderr, "must be one of: localhost or 127.0.0.1\n\n", dest)
+		fmt.Fprintf(Stderr, "error: invalid TCP source %q\n", dest)
+		fmt.Fprint(Stderr, "must be one of: localhost or 127.0.0.1\n\n", dest)
 		return errHelp
 	}
 
 	if p, err := strconv.ParseUint(dstPortStr, 10, 16); p == 0 || err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid port %q\n\n", dstPortStr)
+		fmt.Fprintf(Stderr, "error: invalid port %q\n\n", dstPortStr)
 		return errHelp
 	}
 
@@ -710,10 +708,7 @@ func (e *serveEnv) printWebStatusTree(sc *ipn.ServeConfig, hp ipn.HostPort) erro
 		return "", ""
 	}
 
-	var mounts []string
-	for k := range sc.Web[hp].Handlers {
-		mounts = append(mounts, k)
-	}
+	mounts := slicesx.MapKeys(sc.Web[hp].Handlers)
 	sort.Slice(mounts, func(i, j int) bool {
 		return len(mounts[i]) < len(mounts[j])
 	})
@@ -804,10 +799,10 @@ func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string,
 		return nil // already enabled
 	}
 	if info.Text != "" {
-		fmt.Fprintln(os.Stdout, "\n"+info.Text)
+		fmt.Fprintln(Stdout, "\n"+info.Text)
 	}
 	if info.URL != "" {
-		fmt.Fprintln(os.Stdout, "\n         "+info.URL+"\n")
+		fmt.Fprintln(Stdout, "\n         "+info.URL+"\n")
 	}
 	if !info.ShouldWait {
 		e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_not_awaiting_enablement", feature), 1)
@@ -852,7 +847,7 @@ func (e *serveEnv) enableFeatureInteractive(ctx context.Context, feature string,
 			}
 			if gotAll {
 				e.lc.IncrementCounter(ctx, fmt.Sprintf("%s_enabled", feature), 1)
-				fmt.Fprintln(os.Stdout, "Success.")
+				fmt.Fprintln(Stdout, "Success.")
 				return nil
 			}
 		}

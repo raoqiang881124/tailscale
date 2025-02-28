@@ -19,14 +19,16 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/netlink"
 	"github.com/tailscale/wireguard-go/tun"
-	"github.com/vishvananda/netlink"
 	"go4.org/netipx"
+	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/linuxfw"
+	"tailscale.com/version/distro"
 )
 
 func TestRouterStates(t *testing.T) {
@@ -94,11 +96,49 @@ ip route add 192.168.16.0/24 dev tailscale0 table 52` + basic,
 		{
 			name: "addr and routes and subnet routes with netfilter",
 			in: &Config{
-				LocalAddrs:       mustCIDRs("100.101.102.104/10"),
-				Routes:           mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
-				SubnetRoutes:     mustCIDRs("200.0.0.0/8"),
-				SNATSubnetRoutes: true,
-				NetfilterMode:    netfilterOn,
+				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
+				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
+				SubnetRoutes:      mustCIDRs("200.0.0.0/8"),
+				SNATSubnetRoutes:  true,
+				StatefulFiltering: true,
+				NetfilterMode:     netfilterOn,
+			},
+			want: `
+up
+ip addr add 100.101.102.104/10 dev tailscale0
+ip route add 10.0.0.0/8 dev tailscale0 table 52
+ip route add 100.100.100.100/32 dev tailscale0 table 52` + basic +
+				`v4/filter/FORWARD -j ts-forward
+v4/filter/INPUT -j ts-input
+v4/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v4/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
+v4/filter/ts-forward -o tailscale0 -s 100.64.0.0/10 -j DROP
+v4/filter/ts-forward -o tailscale0 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
+v4/filter/ts-forward -o tailscale0 -j ACCEPT
+v4/filter/ts-input -i lo -s 100.101.102.104 -j ACCEPT
+v4/filter/ts-input ! -i tailscale0 -s 100.115.92.0/23 -j RETURN
+v4/filter/ts-input ! -i tailscale0 -s 100.64.0.0/10 -j DROP
+v4/nat/POSTROUTING -j ts-postrouting
+v4/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
+v6/filter/FORWARD -j ts-forward
+v6/filter/INPUT -j ts-input
+v6/filter/ts-forward -i tailscale0 -j MARK --set-mark 0x40000/0xff0000
+v6/filter/ts-forward -m mark --mark 0x40000/0xff0000 -j ACCEPT
+v6/filter/ts-forward -o tailscale0 -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP
+v6/filter/ts-forward -o tailscale0 -j ACCEPT
+v6/nat/POSTROUTING -j ts-postrouting
+v6/nat/ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE
+`,
+		},
+		{
+			name: "addr and routes and subnet routes with netfilter but no stateful filtering",
+			in: &Config{
+				LocalAddrs:        mustCIDRs("100.101.102.104/10"),
+				Routes:            mustCIDRs("100.100.100.100/32", "10.0.0.0/8"),
+				SubnetRoutes:      mustCIDRs("200.0.0.0/8"),
+				SNATSubnetRoutes:  true,
+				StatefulFiltering: false,
+				NetfilterMode:     netfilterOn,
 			},
 			want: `
 up
@@ -331,7 +371,8 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 	defer mon.Close()
 
 	fake := NewFakeOS(t)
-	router, err := newUserspaceRouterAdvanced(t.Logf, "tailscale0", mon, fake)
+	ht := new(health.Tracker)
+	router, err := newUserspaceRouterAdvanced(t.Logf, "tailscale0", mon, fake, ht)
 	router.(*linuxRouter).nfr = fake.nfr
 	if err != nil {
 		t.Fatalf("failed to create router: %v", err)
@@ -411,6 +452,22 @@ func insertRule(n *fakeIPTablesRunner, curIPT map[string][]string, chain, newRul
 	return nil
 }
 
+func insertRuleAt(n *fakeIPTablesRunner, curIPT map[string][]string, chain string, pos int, newRule string) {
+	rules, ok := curIPT[chain]
+	if !ok {
+		n.t.Fatalf("no %s chain exists", chain)
+	}
+
+	// If the given position is after the end of the chain, error.
+	if pos > len(rules) {
+		n.t.Fatalf("position %d > len(chain %s) %d", pos, chain, len(chain))
+	}
+
+	// Insert the rule at the given position
+	rules = slices.Insert(rules, pos, newRule)
+	curIPT[chain] = rules
+}
+
 func appendRule(n *fakeIPTablesRunner, curIPT map[string][]string, chain, newRule string) error {
 	// Get current rules for filter/ts-input chain with according IP version
 	curTSInputRules, ok := curIPT[chain]
@@ -470,11 +527,26 @@ func (n *fakeIPTablesRunner) AddDNATRule(origDst, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
 
-func (n *fakeIPTablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
+func (n *fakeIPTablesRunner) DNATWithLoadBalancer(netip.Addr, []netip.Addr) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) EnsureSNATForDst(src, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
 
 func (n *fakeIPTablesRunner) DNATNonTailscaleTraffic(exemptInterface string, dst netip.Addr) error {
+	return errors.New("not implemented")
+}
+func (n *fakeIPTablesRunner) EnsurePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm linuxfw.PortMap) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) DeletePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm linuxfw.PortMap) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) DeleteSvc(svc, tun string, targetIPs []netip.Addr, pm []linuxfw.PortMap) error {
 	return errors.New("not implemented")
 }
 
@@ -607,6 +679,33 @@ func (n *fakeIPTablesRunner) DelSNATRule() error {
 	return nil
 }
 
+func (n *fakeIPTablesRunner) AddStatefulRule(tunname string) error {
+	newRule := fmt.Sprintf("-o %s -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP", tunname)
+	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
+		// Mimic the real runner and insert after the 'accept all' rule
+		wantRule := fmt.Sprintf("-o %s -j ACCEPT", tunname)
+
+		const chain = "filter/ts-forward"
+		pos := slices.Index(ipt[chain], wantRule)
+		if pos < 0 {
+			n.t.Fatalf("no rule %q in chain %s", wantRule, chain)
+		}
+
+		insertRuleAt(n, ipt, chain, pos, newRule)
+	}
+	return nil
+}
+
+func (n *fakeIPTablesRunner) DelStatefulRule(tunname string) error {
+	delRule := fmt.Sprintf("-o %s -m conntrack ! --ctstate ESTABLISHED,RELATED -j DROP", tunname)
+	for _, ipt := range []map[string][]string{n.ipt4, n.ipt6} {
+		if err := deleteRule(n, ipt, "filter/ts-forward", delRule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // buildMagicsockPortRule builds a fake rule to use in AddMagicsockPortRule and
 // DelMagicsockPortRule below.
 func buildMagicsockPortRule(port uint16) string {
@@ -659,8 +758,9 @@ func (n *fakeIPTablesRunner) DelMagicsockPortRule(port uint16, network string) e
 	return nil
 }
 
-func (n *fakeIPTablesRunner) HasIPV6() bool    { return true }
-func (n *fakeIPTablesRunner) HasIPV6NAT() bool { return true }
+func (n *fakeIPTablesRunner) HasIPV6() bool       { return true }
+func (n *fakeIPTablesRunner) HasIPV6NAT() bool    { return true }
+func (n *fakeIPTablesRunner) HasIPV6Filter() bool { return true }
 
 // fakeOS implements commandRunner and provides v4 and v6
 // netfilterRunners, but captures changes without touching the OS.
@@ -881,7 +981,7 @@ func newLinuxRootTest(t *testing.T) *linuxTest {
 	mon.Start()
 	lt.mon = mon
 
-	r, err := newUserspaceRouter(logf, lt.tun, mon)
+	r, err := newUserspaceRouter(logf, lt.tun, mon, nil)
 	if err != nil {
 		lt.Close()
 		t.Fatal(err)
@@ -908,7 +1008,7 @@ func TestDelRouteIdempotent(t *testing.T) {
 			t.Error(err)
 			continue
 		}
-		for i := 0; i < 2; i++ {
+		for i := range 2 {
 			if err := lt.r.delRoute(cidr); err != nil {
 				t.Errorf("delRoute(i=%d): %v", i, err)
 			}
@@ -1131,4 +1231,25 @@ func adjustFwmask(t *testing.T, s string) string {
 	}
 
 	return fwmaskAdjustRe.ReplaceAllString(s, "$1")
+}
+
+func TestIPRulesForUBNT(t *testing.T) {
+	// Override the global getDistroFunc
+	getDistroFunc = func() distro.Distro {
+		return distro.UBNT
+	}
+	defer func() { getDistroFunc = distro.Get }() // Restore original after the test
+
+	expected := ubntIPRules
+	actual := ipRules()
+
+	if len(expected) != len(actual) {
+		t.Fatalf("Expected %d rules, got %d", len(expected), len(actual))
+	}
+
+	for i, rule := range expected {
+		if rule != actual[i] {
+			t.Errorf("Rule mismatch at index %d: expected %+v, got %+v", i, rule, actual[i])
+		}
+	}
 }

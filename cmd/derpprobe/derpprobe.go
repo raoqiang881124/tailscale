@@ -7,8 +7,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"html"
-	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -16,21 +14,48 @@ import (
 
 	"tailscale.com/prober"
 	"tailscale.com/tsweb"
+	"tailscale.com/version"
 )
 
 var (
-	derpMapURL = flag.String("derp-map", "https://login.tailscale.com/derpmap/default", "URL to DERP map (https:// or file://)")
-	listen     = flag.String("listen", ":8030", "HTTP listen address")
-	probeOnce  = flag.Bool("once", false, "probe once and print results, then exit; ignores the listen flag")
-	spread     = flag.Bool("spread", true, "whether to spread probing over time")
-	interval   = flag.Duration("interval", 15*time.Second, "probe interval")
+	derpMapURL         = flag.String("derp-map", "https://login.tailscale.com/derpmap/default", "URL to DERP map (https:// or file://) or 'local' to use the local tailscaled's DERP map")
+	versionFlag        = flag.Bool("version", false, "print version and exit")
+	listen             = flag.String("listen", ":8030", "HTTP listen address")
+	probeOnce          = flag.Bool("once", false, "probe once and print results, then exit; ignores the listen flag")
+	spread             = flag.Bool("spread", true, "whether to spread probing over time")
+	interval           = flag.Duration("interval", 15*time.Second, "probe interval")
+	meshInterval       = flag.Duration("mesh-interval", 15*time.Second, "mesh probe interval")
+	stunInterval       = flag.Duration("stun-interval", 15*time.Second, "STUN probe interval")
+	tlsInterval        = flag.Duration("tls-interval", 15*time.Second, "TLS probe interval")
+	bwInterval         = flag.Duration("bw-interval", 0, "bandwidth probe interval (0 = no bandwidth probing)")
+	bwSize             = flag.Int64("bw-probe-size-bytes", 1_000_000, "bandwidth probe size")
+	bwTUNIPv4Address   = flag.String("bw-tun-ipv4-addr", "", "if specified, bandwidth probes will be performed over a TUN device at this address in order to exercise TCP-in-TCP in similar fashion to TCP over Tailscale via DERP; we will use a /30 subnet including this IP address")
+	qdPacketsPerSecond = flag.Int("qd-packets-per-second", 0, "if greater than 0, queuing delay will be measured continuously using 260 byte packets (approximate size of a CallMeMaybe packet) sent at this rate per second")
+	qdPacketTimeout    = flag.Duration("qd-packet-timeout", 5*time.Second, "queuing delay packets arriving after this period of time from being sent are treated like dropped packets and don't count toward queuing delay timings")
+	regionCodeOrID     = flag.String("region-code", "", "probe only this region (e.g. 'lax' or '17'); if left blank, all regions will be probed")
 )
 
 func main() {
 	flag.Parse()
+	if *versionFlag {
+		fmt.Println(version.Long())
+		return
+	}
 
 	p := prober.New().WithSpread(*spread).WithOnce(*probeOnce).WithMetricNamespace("derpprobe")
-	dp, err := prober.DERP(p, *derpMapURL, *interval, *interval, *interval)
+	opts := []prober.DERPOpt{
+		prober.WithMeshProbing(*meshInterval),
+		prober.WithSTUNProbing(*stunInterval),
+		prober.WithTLSProbing(*tlsInterval),
+		prober.WithQueuingDelayProbing(*qdPacketsPerSecond, *qdPacketTimeout),
+	}
+	if *bwInterval > 0 {
+		opts = append(opts, prober.WithBandwidthProbing(*bwInterval, *bwSize, *bwTUNIPv4Address))
+	}
+	if *regionCodeOrID != "" {
+		opts = append(opts, prober.WithRegionCodeOrID(*regionCodeOrID))
+	}
+	dp, err := prober.DERP(p, *derpMapURL, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -51,8 +76,19 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	tsweb.Debugger(mux)
-	mux.HandleFunc("/", http.HandlerFunc(serveFunc(p)))
+	d := tsweb.Debugger(mux)
+	d.Handle("probe-run", "Run a probe", tsweb.StdHandler(tsweb.ReturnHandlerFunc(p.RunHandler), tsweb.HandlerOptions{Logf: log.Printf}))
+	mux.Handle("/", tsweb.StdHandler(p.StatusHandler(
+		prober.WithTitle("DERP Prober"),
+		prober.WithPageLink("Prober metrics", "/debug/varz"),
+		prober.WithProbeLink("Run Probe", "/debug/probe-run?name={{.Name}}"),
+	), tsweb.HandlerOptions{Logf: log.Printf}))
+	mux.Handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok\n"))
+	}))
+	log.Printf("Listening on %s", *listen)
 	log.Fatal(http.ListenAndServe(*listen, mux))
 }
 
@@ -74,7 +110,7 @@ func getOverallStatus(p *prober.Prober) (o overallStatus) {
 			// Do not show probes that have not finished yet.
 			continue
 		}
-		if i.Result {
+		if i.Status == prober.ProbeStatusSucceeded {
 			o.addGoodf("%s: %s", p, i.Latency)
 		} else {
 			o.addBadf("%s: %s", p, i.Error)
@@ -84,27 +120,4 @@ func getOverallStatus(p *prober.Prober) (o overallStatus) {
 	sort.Strings(o.bad)
 	sort.Strings(o.good)
 	return
-}
-
-func serveFunc(p *prober.Prober) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		st := getOverallStatus(p)
-		summary := "All good"
-		if (float64(len(st.bad)) / float64(len(st.bad)+len(st.good))) > 0.25 {
-			// Returning a 500 allows monitoring this server externally and configuring
-			// an alert on HTTP response code.
-			w.WriteHeader(500)
-			summary = fmt.Sprintf("%d problems", len(st.bad))
-		}
-
-		io.WriteString(w, "<html><head><style>.bad { font-weight: bold; color: #700; }</style></head>\n")
-		fmt.Fprintf(w, "<body><h1>derp probe</h1>\n%s:<ul>", summary)
-		for _, s := range st.bad {
-			fmt.Fprintf(w, "<li class=bad>%s</li>\n", html.EscapeString(s))
-		}
-		for _, s := range st.good {
-			fmt.Fprintf(w, "<li>%s</li>\n", html.EscapeString(s))
-		}
-		io.WriteString(w, "</ul></body></html>\n")
-	}
 }

@@ -36,7 +36,7 @@ import (
 	"strings"
 	"time"
 
-	"tailscale.com/client/tailscale"
+	"tailscale.com/client/local"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -46,6 +46,7 @@ var (
 	backendAddr  = flag.String("backend-addr", "", "Address of the Grafana server served over HTTP, in host:port format. Typically localhost:nnnn.")
 	tailscaleDir = flag.String("state-dir", "./", "Alternate directory to use for Tailscale state storage. If empty, a default is used.")
 	useHTTPS     = flag.Bool("use-https", false, "Serve over HTTPS via your *.ts.net subdomain if enabled in Tailscale admin.")
+	loginServer  = flag.String("login-server", "", "URL to alternative control server. If empty, the default Tailscale control is used.")
 )
 
 func main() {
@@ -57,8 +58,9 @@ func main() {
 		log.Fatal("missing --backend-addr")
 	}
 	ts := &tsnet.Server{
-		Dir:      *tailscaleDir,
-		Hostname: *hostname,
+		Dir:        *tailscaleDir,
+		Hostname:   *hostname,
+		ControlURL: *loginServer,
 	}
 
 	// TODO(bradfitz,maisem): move this to a method on tsnet.Server probably.
@@ -88,7 +90,7 @@ func main() {
 
 		go func() {
 			// wait for tailscale to start before trying to fetch cert names
-			for i := 0; i < 60; i++ {
+			for range 60 {
 				st, err := localClient.Status(context.Background())
 				if err != nil {
 					log.Printf("error retrieving tailscale status; retrying: %v", err)
@@ -125,7 +127,7 @@ func main() {
 	log.Fatal(http.Serve(ln, proxy))
 }
 
-func modifyRequest(req *http.Request, localClient *tailscale.LocalClient) {
+func modifyRequest(req *http.Request, localClient *local.Client) {
 	// with enable_login_token set to true, we get a cookie that handles
 	// auth for paths that are not /login
 	if req.URL.Path != "/login" {
@@ -142,7 +144,7 @@ func modifyRequest(req *http.Request, localClient *tailscale.LocalClient) {
 	req.Header.Set("X-Webauth-Name", user.DisplayName)
 }
 
-func getTailscaleUser(ctx context.Context, localClient *tailscale.LocalClient, ipPort string) (*tailcfg.UserProfile, error) {
+func getTailscaleUser(ctx context.Context, localClient *local.Client, ipPort string) (*tailcfg.UserProfile, error) {
 	whois, err := localClient.WhoIs(ctx, ipPort)
 	if err != nil {
 		return nil, fmt.Errorf("failed to identify remote host: %w", err)
