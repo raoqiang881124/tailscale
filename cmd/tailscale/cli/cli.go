@@ -65,15 +65,22 @@ func newFlagSet(name string) *flag.FlagSet {
 func CleanUpArgs(args []string) []string {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
+		switch {
 		// Rewrite --authkey to --auth-key, and --authkey=x to --auth-key=x,
 		// and the same for the -authkey variant.
-		switch {
 		case arg == "--authkey", arg == "-authkey":
 			arg = "--auth-key"
 		case strings.HasPrefix(arg, "--authkey="), strings.HasPrefix(arg, "-authkey="):
-			arg = strings.TrimLeft(arg, "-")
-			arg = strings.TrimPrefix(arg, "authkey=")
-			arg = "--auth-key=" + arg
+			_, val, _ := strings.Cut(arg, "=")
+			arg = "--auth-key=" + val
+
+		// And the same, for posture-checking => report-posture
+		case arg == "--posture-checking", arg == "-posture-checking":
+			arg = "--report-posture"
+		case strings.HasPrefix(arg, "--posture-checking="), strings.HasPrefix(arg, "-posture-checking="):
+			_, val, _ := strings.Cut(arg, "=")
+			arg = "--report-posture=" + val
+
 		}
 		out = append(out, arg)
 	}
@@ -200,6 +207,8 @@ func noDupFlagify(c *ffcli.Command) {
 	}
 }
 
+var fileCmd func() *ffcli.Command
+
 func newRootCmd() *ffcli.Command {
 	rootfs := newFlagSet("tailscale")
 	rootfs.Func("socket", "path to tailscaled socket", func(s string) error {
@@ -240,7 +249,7 @@ change in the future.
 			serveCmd(),
 			versionCmd,
 			webCmd,
-			fileCmd,
+			nilOrCall(fileCmd),
 			bugReportCmd,
 			certCmd,
 			netlockCmd,
@@ -277,6 +286,13 @@ change in the future.
 
 func nonNilCmds(cmds ...*ffcli.Command) []*ffcli.Command {
 	return slicesx.AppendNonzero(cmds[:0], cmds)
+}
+
+func nilOrCall(f func() *ffcli.Command) *ffcli.Command {
+	if f == nil {
+		return nil
+	}
+	return f()
 }
 
 func fatalf(format string, a ...any) {

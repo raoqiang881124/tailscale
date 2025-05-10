@@ -36,6 +36,7 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
@@ -60,8 +61,6 @@ type peerDNSQueryHandler interface {
 type peerAPIServer struct {
 	b        *LocalBackend
 	resolver peerDNSQueryHandler
-
-	taildrop *taildrop_Manager
 }
 
 func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
@@ -770,7 +769,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// but an app connector explicitly adds 0.0.0.0/32 (and the
 	// IPv6 equivalent) to make this work (see updateFilterLocked
 	// in LocalBackend).
-	f := b.filterAtomic.Load()
+	f := b.currentNode().filter()
 	if f == nil {
 		return false
 	}
@@ -1094,6 +1093,48 @@ func parseDriveFileExtensionForLog(path string) string {
 	}
 
 	return fileExt
+}
+
+// peerAPIURL returns an HTTP URL for the peer's peerapi service,
+// without a trailing slash.
+//
+// If ip or port is the zero value then it returns the empty string.
+func peerAPIURL(ip netip.Addr, port uint16) string {
+	if port == 0 || !ip.IsValid() {
+		return ""
+	}
+	return fmt.Sprintf("http://%v", netip.AddrPortFrom(ip, port))
+}
+
+// peerAPIBase returns the "http://ip:port" URL base to reach peer's peerAPI.
+// It returns the empty string if the peer doesn't support the peerapi
+// or there's no matching address family based on the netmap's own addresses.
+func peerAPIBase(nm *netmap.NetworkMap, peer tailcfg.NodeView) string {
+	if nm == nil || !peer.Valid() || !peer.Hostinfo().Valid() {
+		return ""
+	}
+
+	var have4, have6 bool
+	addrs := nm.GetAddresses()
+	for _, a := range addrs.All() {
+		if !a.IsSingleIP() {
+			continue
+		}
+		switch {
+		case a.Addr().Is4():
+			have4 = true
+		case a.Addr().Is6():
+			have6 = true
+		}
+	}
+	p4, p6 := peerAPIPorts(peer)
+	switch {
+	case have4 && p4 != 0:
+		return peerAPIURL(nodeIP(peer, netip.Addr.Is4), p4)
+	case have6 && p6 != 0:
+		return peerAPIURL(nodeIP(peer, netip.Addr.Is6), p6)
+	}
+	return ""
 }
 
 // newFakePeerAPIListener creates a new net.Listener that acts like

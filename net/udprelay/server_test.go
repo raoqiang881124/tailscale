@@ -17,6 +17,7 @@ import (
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
+	"tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 )
@@ -174,8 +175,7 @@ func TestServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// We expect the same endpoint details as the 3-way bind handshake has not
-	// yet been completed for both relay client parties.
+	// We expect the same endpoint details pre-handshake.
 	if diff := cmp.Diff(dupEndpoint, endpoint, cmpopts.EquateComparable(netip.AddrPort{}, key.DiscoPublic{})); diff != "" {
 		t.Fatalf("wrong dupEndpoint (-got +want)\n%s", diff)
 	}
@@ -190,6 +190,15 @@ func TestServer(t *testing.T) {
 
 	tcA.handshake(t)
 	tcB.handshake(t)
+
+	dupEndpoint, err = server.AllocateEndpoint(discoA.Public(), discoB.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// We expect the same endpoint details post-handshake.
+	if diff := cmp.Diff(dupEndpoint, endpoint, cmpopts.EquateComparable(netip.AddrPort{}, key.DiscoPublic{})); diff != "" {
+		t.Fatalf("wrong dupEndpoint (-got +want)\n%s", diff)
+	}
 
 	txToB := []byte{1, 2, 3}
 	tcA.writeDataPkt(t, txToB)
@@ -251,7 +260,7 @@ func TestServerEndpointJSONUnmarshal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var out ServerEndpoint
+			var out endpoint.ServerEndpoint
 			err := json.Unmarshal(tt.json, &out)
 			if tt.wantErr != (err != nil) {
 				t.Fatalf("wantErr: %v (err == nil): %v", tt.wantErr, err == nil)
@@ -266,11 +275,11 @@ func TestServerEndpointJSONUnmarshal(t *testing.T) {
 func TestServerEndpointJSONMarshal(t *testing.T) {
 	tests := []struct {
 		name           string
-		serverEndpoint ServerEndpoint
+		serverEndpoint endpoint.ServerEndpoint
 	}{
 		{
 			name: "valid roundtrip",
-			serverEndpoint: ServerEndpoint{
+			serverEndpoint: endpoint.ServerEndpoint{
 				ServerDisco:         key.NewDisco().Public(),
 				LamportID:           uint64(math.MaxUint64),
 				AddrPorts:           []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1"), netip.MustParseAddrPort("127.0.0.2:2")},
@@ -287,7 +296,7 @@ func TestServerEndpointJSONMarshal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var got ServerEndpoint
+			var got endpoint.ServerEndpoint
 			err = json.Unmarshal(b, &got)
 			if err != nil {
 				t.Fatal(err)
