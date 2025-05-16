@@ -1,42 +1,40 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build !ts_omit_taildrop
-
-package ipnlocal
+package taildrop
 
 import (
 	"fmt"
 	"testing"
 
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tstest/deptest"
-	"tailscale.com/types/netmap"
-	"tailscale.com/util/mak"
 )
 
 func TestFileTargets(t *testing.T) {
-	b := new(LocalBackend)
-	_, err := b.FileTargets()
+	e := new(Extension)
+
+	_, err := e.FileTargets()
 	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
 		t.Errorf("before connect: got %q; want %q", got, want)
 	}
 
-	b.netMap = new(netmap.NetworkMap)
-	_, err = b.FileTargets()
+	e.nodeBackendForTest = testNodeBackend{peers: nil}
+
+	_, err = e.FileTargets()
 	if got, want := fmt.Sprint(err), "not connected to the tailnet"; got != want {
 		t.Errorf("non-running netmap: got %q; want %q", got, want)
 	}
 
-	b.state = ipn.Running
-	_, err = b.FileTargets()
+	e.backendState = ipn.Running
+	_, err = e.FileTargets()
 	if got, want := fmt.Sprint(err), "file sharing not enabled by Tailscale admin"; got != want {
 		t.Errorf("without cap: got %q; want %q", got, want)
 	}
 
-	b.capFileSharing = true
-	got, err := b.FileTargets()
+	e.capFileSharing = true
+	got, err := e.FileTargets()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,34 +42,32 @@ func TestFileTargets(t *testing.T) {
 		t.Fatalf("unexpected %d peers", len(got))
 	}
 
-	var peerMap map[tailcfg.NodeID]tailcfg.NodeView
-	mak.NonNil(&peerMap)
-	var nodeID tailcfg.NodeID
-	nodeID = 1234
+	var nodeID tailcfg.NodeID = 1234
 	peer := &tailcfg.Node{
-		ID:       1234,
+		ID:       nodeID,
 		Hostinfo: (&tailcfg.Hostinfo{OS: "tvOS"}).View(),
 	}
-	peerMap[nodeID] = peer.View()
-	b.peers = peerMap
-	got, err = b.FileTargets()
+	e.nodeBackendForTest = testNodeBackend{peers: []tailcfg.NodeView{peer.View()}}
+
+	got, err = e.FileTargets()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
 		t.Fatalf("unexpected %d peers", len(got))
 	}
-	// (other cases handled by TestPeerAPIBase above)
 }
 
-func TestOmitTaildropDeps(t *testing.T) {
-	deptest.DepChecker{
-		Tags:   "ts_omit_taildrop",
-		GOOS:   "linux",
-		GOARCH: "amd64",
-		BadDeps: map[string]string{
-			"tailscale.com/taildrop":         "should be omitted",
-			"tailscale.com/feature/taildrop": "should be omitted",
-		},
-	}.Check(t)
+type testNodeBackend struct {
+	ipnext.NodeBackend
+	peers []tailcfg.NodeView
+}
+
+func (t testNodeBackend) AppendMatchingPeers(peers []tailcfg.NodeView, f func(tailcfg.NodeView) bool) []tailcfg.NodeView {
+	for _, p := range t.peers {
+		if f(p) {
+			peers = append(peers, p)
+		}
+	}
+	return peers
 }

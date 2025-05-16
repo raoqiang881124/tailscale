@@ -19,8 +19,8 @@ import (
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/net/udprelay"
+	"tailscale.com/net/udprelay/endpoint"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsd"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/ptr"
@@ -40,7 +40,7 @@ func init() {
 // newExtension is an [ipnext.NewExtensionFn] that creates a new relay server
 // extension. It is registered with [ipnext.RegisterExtension] if the package is
 // imported.
-func newExtension(logf logger.Logf, _ *tsd.System) (ipnext.Extension, error) {
+func newExtension(logf logger.Logf, _ ipnext.SafeBackend) (ipnext.Extension, error) {
 	return &extension{logf: logger.WithPrefix(logf, featureName+": ")}, nil
 }
 
@@ -58,7 +58,7 @@ type extension struct {
 
 // relayServer is the interface of [udprelay.Server].
 type relayServer interface {
-	AllocateEndpoint(discoA key.DiscoPublic, discoB key.DiscoPublic) (udprelay.ServerEndpoint, error)
+	AllocateEndpoint(discoA key.DiscoPublic, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error)
 	Close() error
 }
 
@@ -72,9 +72,19 @@ func (e *extension) Name() string {
 func (e *extension) Init(host ipnext.Host) error {
 	profile, prefs := host.Profiles().CurrentProfileState()
 	e.profileStateChanged(profile, prefs, false)
-	host.Profiles().RegisterProfileStateChangeCallback(e.profileStateChanged)
-	// TODO(jwhited): callback for netmap/nodeattr changes (e.hasNodeAttrRelayServer)
+	host.Hooks().ProfileStateChange.Add(e.profileStateChanged)
+	host.Hooks().OnSelfChange.Add(e.selfNodeViewChanged)
 	return nil
+}
+
+func (e *extension) selfNodeViewChanged(nodeView tailcfg.NodeView) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.hasNodeAttrRelayServer = nodeView.HasCap(tailcfg.NodeAttrRelayServer)
+	if !e.hasNodeAttrRelayServer && e.server != nil {
+		e.server.Close()
+		e.server = nil
+	}
 }
 
 func (e *extension) profileStateChanged(_ ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
@@ -134,7 +144,7 @@ func (e *extension) relayServerOrInit() (relayServer, error) {
 }
 
 func handlePeerAPIRelayAllocateEndpoint(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r *http.Request) {
-	e, ok := h.LocalBackend().FindExtensionByName(featureName).(*extension)
+	e, ok := ipnlocal.GetExt[*extension](h.LocalBackend())
 	if !ok {
 		http.Error(w, "relay failed to initialize", http.StatusServiceUnavailable)
 		return
