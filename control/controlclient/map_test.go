@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"go4.org/mem"
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/health"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/tstime"
@@ -1134,5 +1136,49 @@ func BenchmarkMapSessionDelta(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// TestNetmapHealthIntegration checks that we get the expected health warnings
+// from processing a map response and passing the NetworkMap to a health tracker
+func TestNetmapHealthIntegration(t *testing.T) {
+	ms := newTestMapSession(t, nil)
+	ht := health.Tracker{}
+
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	nm := ms.netmapForResponse(&tailcfg.MapResponse{
+		Health: []string{
+			"Test message",
+			"Another message",
+		},
+	})
+	ht.SetControlHealth(nm.DisplayMessages)
+
+	want := map[health.WarnableCode]health.UnhealthyState{
+		"control-health-c0719e9a8d5d838d861dc6f675c899d2b309a3a65bb9fe6b11e5afcbf9a2c0b1": {
+			WarnableCode: "control-health-c0719e9a8d5d838d861dc6f675c899d2b309a3a65bb9fe6b11e5afcbf9a2c0b1",
+			Title:        "Coordination server reports an issue",
+			Severity:     health.SeverityMedium,
+			Text:         "The coordination server is reporting a health issue: Test message",
+		},
+		"control-health-1dc7017a73a3c55c0d6a8423e3813c7ab6562d9d3064c2ec6ac7822f61b1db9c": {
+			WarnableCode: "control-health-1dc7017a73a3c55c0d6a8423e3813c7ab6562d9d3064c2ec6ac7822f61b1db9c",
+			Title:        "Coordination server reports an issue",
+			Severity:     health.SeverityMedium,
+			Text:         "The coordination server is reporting a health issue: Another message",
+		},
+	}
+
+	got := maps.Clone(ht.CurrentState().Warnings)
+	for k := range got {
+		if !strings.HasPrefix(string(k), "control-health") {
+			delete(got, k)
+		}
+	}
+
+	if d := cmp.Diff(want, got); d != "" {
+		t.Fatalf("CurrentStatus().Warnings[\"control-health*\"] different than expected (-want +got)\n%s", d)
 	}
 }
