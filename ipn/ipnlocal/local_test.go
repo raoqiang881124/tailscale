@@ -920,15 +920,15 @@ func TestWatchNotificationsCallbacks(t *testing.T) {
 // tests LocalBackend.updateNetmapDeltaLocked
 func TestUpdateNetmapDelta(t *testing.T) {
 	b := newTestLocalBackend(t)
-	if b.updateNetmapDeltaLocked(nil) {
+	if b.currentNode().UpdateNetmapDelta(nil) {
 		t.Errorf("updateNetmapDeltaLocked() = true, want false with nil netmap")
 	}
 
-	b.netMap = &netmap.NetworkMap{}
+	nm := &netmap.NetworkMap{}
 	for i := range 5 {
-		b.netMap.Peers = append(b.netMap.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
+		nm.Peers = append(nm.Peers, (&tailcfg.Node{ID: (tailcfg.NodeID(i) + 1)}).View())
 	}
-	b.updatePeersFromNetmapLocked(b.netMap)
+	b.currentNode().SetNetMap(nm)
 
 	someTime := time.Unix(123, 0)
 	muts, ok := netmap.MutationsFromMapResponse(&tailcfg.MapResponse{
@@ -955,7 +955,7 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		t.Fatal("netmap.MutationsFromMapResponse failed")
 	}
 
-	if !b.updateNetmapDeltaLocked(muts) {
+	if !b.currentNode().UpdateNetmapDelta(muts) {
 		t.Fatalf("updateNetmapDeltaLocked() = false, want true with new netmap")
 	}
 
@@ -978,9 +978,9 @@ func TestUpdateNetmapDelta(t *testing.T) {
 		},
 	}
 	for _, want := range wants {
-		gotv, ok := b.peers[want.ID]
+		gotv, ok := b.currentNode().PeerByID(want.ID)
 		if !ok {
-			t.Errorf("netmap.Peer %v missing from b.peers", want.ID)
+			t.Errorf("netmap.Peer %v missing from b.profile.Peers", want.ID)
 			continue
 		}
 		got := gotv.AsStruct()
@@ -1398,7 +1398,7 @@ func TestCoveredRouteRangeNoDefault(t *testing.T) {
 
 func TestReconfigureAppConnector(t *testing.T) {
 	b := newTestBackend(t)
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("unexpected app connector")
 	}
@@ -1411,7 +1411,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector == nil {
 		t.Fatal("expected app connector")
 	}
@@ -1422,15 +1422,19 @@ func TestReconfigureAppConnector(t *testing.T) {
 		"connectors": ["tag:example"]
 	}`
 
-	b.netMap.SelfNode = (&tailcfg.Node{
-		Name: "example.ts.net",
-		Tags: []string{"tag:example"},
-		CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
-			"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
-		}),
-	}).View()
+	nm := &netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			Tags: []string{"tag:example"},
+			CapMap: (tailcfg.NodeCapMap)(map[tailcfg.NodeCapability][]tailcfg.RawMessage{
+				"tailscale.com/app-connectors": {tailcfg.RawMessage(appCfg)},
+			}),
+		}).View(),
+	}
 
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.currentNode().SetNetMap(nm)
+
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.appConnector.Wait(context.Background())
 
 	want := []string{"example.com"}
@@ -1450,7 +1454,7 @@ func TestReconfigureAppConnector(t *testing.T) {
 		},
 		AppConnectorSet: true,
 	})
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	if b.appConnector != nil {
 		t.Fatal("expected no app connector")
 	}
@@ -1482,7 +1486,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 
 	// Smoke check that AdvertiseRoutes doesn't have the test IP.
 	ip := netip.MustParseAddr("1.2.3.4")
@@ -1503,7 +1507,7 @@ func TestBackfillAppConnectorRoutes(t *testing.T) {
 
 	// Mimic b.authReconfigure for the app connector bits.
 	b.mu.Lock()
-	b.reconfigAppConnectorLocked(b.netMap, b.pm.prefs)
+	b.reconfigAppConnectorLocked(b.NetMap(), b.pm.prefs)
 	b.mu.Unlock()
 	b.readvertiseAppConnectorRoutes()
 
@@ -1819,7 +1823,7 @@ func TestSetExitNodeIDPolicy(t *testing.T) {
 			}
 			pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
 			pm.prefs = test.prefs.View()
-			b.netMap = test.nm
+			b.currentNode().SetNetMap(test.nm)
 			b.pm = pm
 			b.lastSuggestedExitNode = test.lastSuggestedExitNode
 
@@ -1946,8 +1950,7 @@ func TestUpdateNetmapDeltaAutoExitNode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newTestLocalBackend(t)
-			b.netMap = tt.netmap
-			b.updatePeersFromNetmapLocked(b.netMap)
+			b.currentNode().SetNetMap(tt.netmap)
 			b.lastSuggestedExitNode = tt.lastSuggestedExitNode
 			b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, tt.report)
 			b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
@@ -2065,14 +2068,14 @@ func TestAutoExitNodeSetNetInfoCallback(t *testing.T) {
 			},
 		},
 	}
-	b.netMap = &netmap.NetworkMap{
+	b.currentNode().SetNetMap(&netmap.NetworkMap{
 		SelfNode: selfNode.View(),
 		Peers: []tailcfg.NodeView{
 			peer1,
 			peer2,
 		},
 		DERPMap: defaultDERPMap,
-	}
+	})
 	b.lastSuggestedExitNode = peer1.StableID()
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
 	if eid := b.Prefs().ExitNodeID(); eid != peer1.StableID() {
@@ -2137,7 +2140,7 @@ func TestSetControlClientStatusAutoExitNode(t *testing.T) {
 		syspolicy.ExitNodeID, "auto:any",
 	))
 	syspolicy.MustRegisterStoreForTest(t, "TestStore", setting.DeviceScope, policyStore)
-	b.netMap = nm
+	b.currentNode().SetNetMap(nm)
 	b.lastSuggestedExitNode = peer1.StableID()
 	b.sys.MagicSock.Get().SetLastNetcheckReportForTest(b.ctx, report)
 	b.SetPrefsForTest(b.pm.CurrentPrefs().AsStruct())
@@ -3068,9 +3071,11 @@ func TestDriveManageShares(t *testing.T) {
 				b.driveSetSharesLocked(tt.existing)
 			}
 			if !tt.disabled {
-				self := b.netMap.SelfNode.AsStruct()
+				nm := ptr.To(*b.currentNode().NetMap())
+				self := nm.SelfNode.AsStruct()
 				self.CapMap = tailcfg.NodeCapMap{tailcfg.NodeAttrsTaildriveShare: nil}
-				b.netMap.SelfNode = self.View()
+				nm.SelfNode = self.View()
+				b.currentNode().SetNetMap(nm)
 				b.sys.Set(driveimpl.NewFileSystemForRemote(b.logf))
 			}
 			b.mu.Unlock()
@@ -5129,10 +5134,17 @@ func TestUpdatePrefsOnSysPolicyChange(t *testing.T) {
 	}
 }
 
-func TestUpdateIngressLocked(t *testing.T) {
+func TestUpdateIngressAndServiceHashLocked(t *testing.T) {
+	prefs := ipn.NewPrefs().View()
+	previousSC := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:abc": {Tun: true},
+		},
+	}
 	tests := []struct {
 		name              string
 		hi                *tailcfg.Hostinfo
+		hasPreviousSC     bool // whether to overwrite the ServeConfig hash in the Hostinfo using previousSC
 		sc                *ipn.ServeConfig
 		wantIngress       bool
 		wantWireIngress   bool
@@ -5159,6 +5171,16 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantControlUpdate: true,
 		},
 		{
+			name: "empty_hostinfo_service_configured",
+			hi:   &tailcfg.Hostinfo{},
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+			wantControlUpdate: true,
+		},
+		{
 			name: "empty_hostinfo_funnel_disabled",
 			hi:   &tailcfg.Hostinfo{},
 			sc: &ipn.ServeConfig{
@@ -5170,7 +5192,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantControlUpdate: true,
 		},
 		{
-			name: "empty_hostinfo_no_funnel",
+			name: "empty_hostinfo_no_funnel_no_service",
 			hi:   &tailcfg.Hostinfo{},
 			sc: &ipn.ServeConfig{
 				TCP: map[uint16]*ipn.TCPPortHandler{
@@ -5192,6 +5214,16 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantWireIngress: false, // implied by wantIngress
 		},
 		{
+			name:          "service_hash_no_change",
+			hi:            &tailcfg.Hostinfo{},
+			hasPreviousSC: true,
+			sc: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+		},
+		{
 			name: "funnel_disabled_no_change",
 			hi: &tailcfg.Hostinfo{
 				WireIngress: true,
@@ -5202,6 +5234,13 @@ func TestUpdateIngressLocked(t *testing.T) {
 				},
 			},
 			wantWireIngress: true, // true if there is any AllowFunnel block
+		},
+		{
+			name:              "service_got_removed",
+			hi:                &tailcfg.Hostinfo{},
+			hasPreviousSC:     true,
+			sc:                &ipn.ServeConfig{},
+			wantControlUpdate: true,
 		},
 		{
 			name: "funnel_changes_to_disabled",
@@ -5230,12 +5269,35 @@ func TestUpdateIngressLocked(t *testing.T) {
 			wantWireIngress:   false, // implied by wantIngress
 			wantControlUpdate: true,
 		},
+		{
+			name: "both_funnel_and_service_changes",
+			hi: &tailcfg.Hostinfo{
+				IngressEnabled: true,
+			},
+			sc: &ipn.ServeConfig{
+				AllowFunnel: map[ipn.HostPort]bool{
+					"tailnet.xyz:443": false,
+				},
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:abc": {Tun: true},
+				},
+			},
+			wantWireIngress:   true, // true if there is any AllowFunnel block
+			wantControlUpdate: true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			b := newTestLocalBackend(t)
 			b.hostinfo = tt.hi
+			if tt.hasPreviousSC {
+				b.mu.Lock()
+				b.serveConfig = previousSC.View()
+				b.hostinfo.ServicesHash = b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+			}
 			b.serveConfig = tt.sc.View()
 			allDone := make(chan bool, 1)
 			defer b.goTracker.AddDoneCallback(func() {
@@ -5251,7 +5313,7 @@ func TestUpdateIngressLocked(t *testing.T) {
 			})()
 
 			was := b.goTracker.StartedGoroutines()
-			b.updateIngressLocked()
+			b.updateIngressAndServiceHashLocked(prefs)
 
 			if tt.hi != nil {
 				if tt.hi.IngressEnabled != tt.wantIngress {
@@ -5259,6 +5321,12 @@ func TestUpdateIngressLocked(t *testing.T) {
 				}
 				if tt.hi.WireIngress != tt.wantWireIngress {
 					t.Errorf("WireIngress = %v, want %v", tt.hi.WireIngress, tt.wantWireIngress)
+				}
+				b.mu.Lock()
+				svcHash := b.vipServiceHash(b.vipServicesFromPrefsLocked(prefs))
+				b.mu.Unlock()
+				if tt.hi.ServicesHash != svcHash {
+					t.Errorf("ServicesHash = %v, want %v", tt.hi.ServicesHash, svcHash)
 				}
 			}
 
@@ -5332,5 +5400,175 @@ func TestSrcCapPacketFilter(t *testing.T) {
 	res = f.Check(netip.MustParseAddr("3.3.3.3"), netip.MustParseAddr("1.1.1.1"), 22, ipproto.TCP)
 	if !res.IsDrop() {
 		t.Error("IsDrop() for node without cap = false, want true")
+	}
+}
+
+func TestDisplayMessages(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title: "Testing",
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	_, ok := state.Warnings["test-message"]
+
+	if !ok {
+		t.Error("no warning found with id 'test-message'")
+	}
+}
+
+// TestDisplayMessagesURLFilter tests that we filter out any URLs that are not
+// valid as a pop browser URL (see [LocalBackend.validPopBrowserURL]).
+func TestDisplayMessagesURLFilter(t *testing.T) {
+	b := newTestLocalBackend(t)
+
+	// Pretend we're in a map poll so health updates get processed
+	ht := b.HealthTracker()
+	ht.SetIPNState("NeedsLogin", true)
+	ht.GotStreamedMapResponse()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.setNetMapLocked(&netmap.NetworkMap{
+		DisplayMessages: map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+			"test-message": {
+				Title:    "Testing",
+				Severity: tailcfg.SeverityHigh,
+				PrimaryAction: &tailcfg.DisplayMessageAction{
+					URL:   "https://www.evil.com",
+					Label: "Phishing Link",
+				},
+			},
+		},
+	})
+
+	state := ht.CurrentState()
+	got, ok := state.Warnings["test-message"]
+
+	if !ok {
+		t.Fatal("no warning found with id 'test-message'")
+	}
+
+	want := health.UnhealthyState{
+		WarnableCode: "test-message",
+		Title:        "Testing",
+		Severity:     health.SeverityHigh,
+	}
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Unexpected message content (-want/+got):\n%s", diff)
+	}
+}
+
+// TestDisplayMessageIPNBus checks that we send health messages appropriately
+// based on whether the watcher has sent the [ipn.NotifyHealthActions] watch
+// option or not.
+func TestDisplayMessageIPNBus(t *testing.T) {
+	type test struct {
+		name        string
+		mask        ipn.NotifyWatchOpt
+		wantWarning health.UnhealthyState
+	}
+
+	msgs := map[tailcfg.DisplayMessageID]tailcfg.DisplayMessage{
+		"test-message": {
+			Title:    "Message title",
+			Text:     "Message text.",
+			Severity: tailcfg.SeverityMedium,
+			PrimaryAction: &tailcfg.DisplayMessageAction{
+				URL:   "https://example.com",
+				Label: "Learn more",
+			},
+		},
+	}
+
+	for _, tt := range []test{
+		{
+			name: "older-client-no-actions",
+			mask: 0,
+			wantWarning: health.UnhealthyState{
+				WarnableCode:  "test-message",
+				Severity:      health.SeverityMedium,
+				Title:         "Message title",
+				Text:          "Message text. Learn more: https://example.com", // PrimaryAction appended to text
+				PrimaryAction: nil,                                             // PrimaryAction not included
+			},
+		},
+		{
+			name: "new-client-with-actions",
+			mask: ipn.NotifyHealthActions,
+			wantWarning: health.UnhealthyState{
+				WarnableCode: "test-message",
+				Severity:     health.SeverityMedium,
+				Title:        "Message title",
+				Text:         "Message text.",
+				PrimaryAction: &health.UnhealthyStateAction{
+					URL:   "https://example.com",
+					Label: "Learn more",
+				},
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			lb := newLocalBackendWithTestControl(t, false, func(tb testing.TB, opts controlclient.Options) controlclient.Client {
+				return newClient(tb, opts)
+			})
+
+			ipnWatcher := newNotificationWatcher(t, lb, nil)
+			ipnWatcher.watch(tt.mask, []wantedNotification{{
+				name: "test",
+				cond: func(_ testing.TB, _ ipnauth.Actor, n *ipn.Notify) bool {
+					if n.Health == nil {
+						return false
+					}
+					got, ok := n.Health.Warnings["test-message"]
+					if ok {
+						if diff := cmp.Diff(tt.wantWarning, got); diff != "" {
+							t.Errorf("unexpected warning details (-want/+got):\n%s", diff)
+							return true // we failed the test so tell the watcher we've seen what we need to to stop it waiting
+						}
+					}
+					return ok
+				},
+			}})
+
+			lb.SetPrefsForTest(&ipn.Prefs{
+				ControlURL:  "https://localhost:1/",
+				WantRunning: true,
+				LoggedOut:   false,
+			})
+			if err := lb.Start(ipn.Options{}); err != nil {
+				t.Fatalf("(*LocalBackend).Start(): %v", err)
+			}
+
+			cc := lb.cc.(*mockControl)
+
+			// Assert that we are logged in and authorized, and also send our DisplayMessages
+			cc.send(nil, "", true, &netmap.NetworkMap{
+				SelfNode:        (&tailcfg.Node{MachineAuthorized: true}).View(),
+				DisplayMessages: msgs,
+			})
+
+			// Tell the health tracker that we are in a map poll because
+			// mockControl doesn't tell it
+			lb.HealthTracker().GotStreamedMapResponse()
+
+			// Assert that we got the expected notification
+			ipnWatcher.check()
+		})
 	}
 }

@@ -27,7 +27,10 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
+	"tailscale.com/tstime"
 	"tailscale.com/types/key"
+	"tailscale.com/types/lazy"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
 	"tailscale.com/util/must"
 )
@@ -284,7 +287,7 @@ func TestNewExtensionHost(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			logf := tstest.WhileTestRunningLogger(t)
-			h, err := NewExtensionHost(logf, tsd.NewSystem(), &testBackend{}, tt.defs...)
+			h, err := NewExtensionHostForTest(logf, &testBackend{}, tt.defs...)
 			if gotErr := err != nil; gotErr != tt.wantErr {
 				t.Errorf("NewExtensionHost: gotErr %v(%v); wantErr %v", gotErr, err, tt.wantErr)
 			}
@@ -577,30 +580,6 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 			},
 		},
 		{
-			// Override the default InitHook used in the test to unregister the callback
-			// after the first call.
-			name: "Register/Once",
-			ext: &testExtension{
-				InitHook: func(e *testExtension) error {
-					var unregister func()
-					handler := func(profile ipn.LoginProfileView, prefs ipn.PrefsView, sameNode bool) {
-						makeStateChangeAppender(e)(profile, prefs, sameNode)
-						unregister()
-					}
-					unregister = e.host.Profiles().RegisterProfileStateChangeCallback(handler)
-					return nil
-				},
-			},
-			stateCalls: []stateChange{
-				{Profile: &ipn.LoginProfile{ID: "profile-1"}},
-				{Profile: &ipn.LoginProfile{ID: "profile-2"}},
-				{Profile: &ipn.LoginProfile{ID: "profile-3"}},
-			},
-			wantChanges: []stateChange{ // only the first call is received by the callback
-				{Profile: &ipn.LoginProfile{ID: "profile-1"}},
-			},
-		},
-		{
 			// Ensure that ipn.Prefs are passed to the callback.
 			name: "CheckPrefs",
 			ext:  &testExtension{},
@@ -770,7 +749,7 @@ func TestExtensionHostProfileStateChangeCallback(t *testing.T) {
 				tt.ext.InitHook = func(e *testExtension) error {
 					// Create and register the callback on init.
 					handler := makeStateChangeAppender(e)
-					e.Cleanup(e.host.Profiles().RegisterProfileStateChangeCallback(handler))
+					e.host.Hooks().ProfileStateChange.Add(handler)
 					return nil
 				}
 			}
@@ -891,14 +870,15 @@ func TestBackgroundProfileResolver(t *testing.T) {
 				}
 			}
 
-			h := newExtensionHostForTest[ipnext.Extension](t, &testBackend{}, true)
+			h := newExtensionHostForTest[ipnext.Extension](t, &testBackend{}, false)
 
 			// Register the resolvers with the host.
 			// This is typically done by the extensions themselves,
 			// but we do it here for testing purposes.
 			for _, r := range tt.resolvers {
-				t.Cleanup(h.Profiles().RegisterBackgroundProfileResolver(r))
+				h.Hooks().BackgroundProfileResolvers.Add(r)
 			}
+			h.Init()
 
 			// Call the resolver to get the profile.
 			gotProfile := h.DetermineBackgroundProfile(pm)
@@ -989,7 +969,7 @@ func TestAuditLogProviders(t *testing.T) {
 					}
 				}
 				ext.InitHook = func(e *testExtension) error {
-					e.Cleanup(e.host.RegisterAuditLogProvider(provider))
+					e.host.Hooks().AuditLoggers.Add(provider)
 					return nil
 				}
 				exts = append(exts, ext)
@@ -1063,6 +1043,38 @@ func TestNilExtensionHostMethodCall(t *testing.T) {
 	}
 }
 
+// extBeforeStartExtension is a test extension used by TestGetExtBeforeStart.
+// It is registered with the [ipnext.RegisterExtension].
+type extBeforeStartExtension struct{}
+
+func init() {
+	ipnext.RegisterExtension("ext-before-start", mkExtBeforeStartExtension)
+}
+
+func mkExtBeforeStartExtension(logger.Logf, ipnext.SafeBackend) (ipnext.Extension, error) {
+	return extBeforeStartExtension{}, nil
+}
+
+func (extBeforeStartExtension) Name() string { return "ext-before-start" }
+func (extBeforeStartExtension) Init(ipnext.Host) error {
+	return nil
+}
+func (extBeforeStartExtension) Shutdown() error {
+	return nil
+}
+
+// TestGetExtBeforeStart verifies that an extension registered via
+// RegisterExtension can be retrieved with GetExt before the host is started
+// (via LocalBackend.Start)
+func TestGetExtBeforeStart(t *testing.T) {
+	lb := newTestBackend(t)
+	// Now call GetExt without calling Start on the LocalBackend.
+	_, ok := GetExt[extBeforeStartExtension](lb)
+	if !ok {
+		t.Fatal("didn't find extension")
+	}
+}
+
 // checkMethodCallWithZeroArgs calls the method m on the receiver r
 // with zero values for all its arguments, except the receiver itself.
 // It returns the result of the method call, or fails the test if the call panics.
@@ -1118,7 +1130,7 @@ func newExtensionHostForTest[T ipnext.Extension](t *testing.T, b Backend, initia
 		}
 		defs[i] = ipnext.DefinitionForTest(ext)
 	}
-	h, err := NewExtensionHost(logf, tsd.NewSystem(), b, defs...)
+	h, err := NewExtensionHostForTest(logf, b, defs...)
 	if err != nil {
 		t.Fatalf("NewExtensionHost: %v", err)
 	}
@@ -1168,11 +1180,13 @@ type testExtension struct {
 	// It can be accessed by tests using [setTestExtensionState],
 	// [getTestExtensionStateOk] and [getTestExtensionState].
 	state map[string]any
-	// cleanup are functions to be called on shutdown.
-	cleanup []func()
 }
 
 var _ ipnext.Extension = (*testExtension)(nil)
+
+// PermitDoubleRegister is a sentinel method whose existence tells the
+// ExtensionHost to permit it to be registered multiple times.
+func (*testExtension) PermitDoubleRegister() {}
 
 func (e *testExtension) setT(t *testing.T) {
 	e.t = t
@@ -1212,22 +1226,11 @@ func (e *testExtension) InitCalled() bool {
 	return e.initCnt.Load() != 0
 }
 
-func (e *testExtension) Cleanup(f func()) {
-	e.mu.Lock()
-	e.cleanup = append(e.cleanup, f)
-	e.mu.Unlock()
-}
-
 // Shutdown implements [ipnext.Extension].
 func (e *testExtension) Shutdown() (err error) {
 	e.t.Helper()
 	e.mu.Lock()
-	cleanup := e.cleanup
-	e.cleanup = nil
 	e.mu.Unlock()
-	for _, f := range cleanup {
-		f()
-	}
 	if e.ShutdownHook != nil {
 		err = e.ShutdownHook(e)
 	}
@@ -1356,6 +1359,7 @@ func (q *testExecQueue) Wait(context.Context) error { return nil }
 // testBackend implements [ipnext.Backend] for testing purposes
 // by calling the provided hooks when its methods are called.
 type testBackend struct {
+	lazySys                 lazy.SyncValue[*tsd.System]
 	switchToBestProfileHook func(reason string)
 
 	// mu protects the backend state.
@@ -1363,6 +1367,14 @@ type testBackend struct {
 	// and released on exit, mimicking the behavior of the [LocalBackend].
 	mu sync.Mutex
 }
+
+func (b *testBackend) Clock() tstime.Clock { return tstime.StdClock{} }
+func (b *testBackend) Sys() *tsd.System {
+	return b.lazySys.Get(tsd.NewSystem)
+}
+func (b *testBackend) SendNotify(ipn.Notify)           { panic("not implemented") }
+func (b *testBackend) NodeBackend() ipnext.NodeBackend { panic("not implemented") }
+func (b *testBackend) TailscaleVarRoot() string        { panic("not implemented") }
 
 func (b *testBackend) SwitchToBestProfile(reason string) {
 	b.mu.Lock()
