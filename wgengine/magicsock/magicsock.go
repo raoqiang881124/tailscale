@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"expvar"
 	"fmt"
@@ -316,7 +317,11 @@ type Conn struct {
 	// by node key, node ID, and discovery key.
 	peerMap peerMap
 
-	// discoInfo is the state for an active DiscoKey.
+	// relayManager manages allocation and handshaking of
+	// [tailscale.com/net/udprelay.Server] endpoints.
+	relayManager relayManager
+
+	// discoInfo is the state for an active peer DiscoKey.
 	discoInfo map[key.DiscoPublic]*discoInfo
 
 	// netInfoFunc is a callback that provides a tailcfg.NetInfo when
@@ -945,7 +950,7 @@ func (c *Conn) callNetInfoCallbackLocked(ni *tailcfg.NetInfo) {
 func (c *Conn) addValidDiscoPathForTest(nodeKey key.NodePublic, addr netip.AddrPort) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.peerMap.setNodeKeyForIPPort(addr, nodeKey)
+	c.peerMap.setNodeKeyForEpAddr(epAddr{ap: addr}, nodeKey)
 }
 
 // SetNetInfoCallback sets the func to be called whenever the network conditions
@@ -1014,13 +1019,16 @@ func (c *Conn) Ping(peer tailcfg.NodeView, res *ipnstate.PingResult, size int, c
 }
 
 // c.mu must be held
-func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency time.Duration, ep netip.AddrPort) {
+func (c *Conn) populateCLIPingResponseLocked(res *ipnstate.PingResult, latency time.Duration, ep epAddr) {
 	res.LatencySeconds = latency.Seconds()
-	if ep.Addr() != tailcfg.DerpMagicIPAddr {
+	if ep.ap.Addr() != tailcfg.DerpMagicIPAddr {
+		// TODO(jwhited): if ep.vni.isSet() we are using a Tailscale client
+		//  as a UDP relay; update PingResult and its interpretation by
+		//  "tailscale ping" to make this clear.
 		res.Endpoint = ep.String()
 		return
 	}
-	regionID := int(ep.Port())
+	regionID := int(ep.ap.Port())
 	res.DERPRegionID = regionID
 	res.DERPRegionCode = c.derpRegionCodeLocked(regionID)
 }
@@ -1259,8 +1267,8 @@ func (c *Conn) networkDown() bool { return !c.networkUp.Load() }
 
 // Send implements conn.Bind.
 //
-// See https://pkg.go.dev/golang.zx2c4.com/wireguard/conn#Bind.Send
-func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint) (err error) {
+// See https://pkg.go.dev/github.com/tailscale/wireguard-go/conn#Bind.Send
+func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint, offset int) (err error) {
 	n := int64(len(buffs))
 	defer func() {
 		if err != nil {
@@ -1273,7 +1281,7 @@ func (c *Conn) Send(buffs [][]byte, ep conn.Endpoint) (err error) {
 		return errNetworkDown
 	}
 	if ep, ok := ep.(*endpoint); ok {
-		return ep.send(buffs)
+		return ep.send(buffs, offset)
 	}
 	// If it's not of type *endpoint, it's probably *lazyEndpoint, which means
 	// we don't actually know who the peer is and we're waiting for wireguard-go
@@ -1289,19 +1297,19 @@ var errNoUDP = errors.New("no UDP available on platform")
 
 var errUnsupportedConnType = errors.New("unsupported connection type")
 
-func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err error) {
+func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool, err error) {
 	isIPv6 := false
 	switch {
-	case addr.Addr().Is4():
-	case addr.Addr().Is6():
+	case addr.ap.Addr().Is4():
+	case addr.ap.Addr().Is6():
 		isIPv6 = true
 	default:
 		panic("bogus sendUDPBatch addr type")
 	}
 	if isIPv6 {
-		err = c.pconn6.WriteBatchTo(buffs, addr)
+		err = c.pconn6.WriteBatchTo(buffs, addr, offset)
 	} else {
-		err = c.pconn4.WriteBatchTo(buffs, addr)
+		err = c.pconn4.WriteBatchTo(buffs, addr, offset)
 	}
 	if err != nil {
 		var errGSO neterror.ErrUDPGSODisabled
@@ -1479,8 +1487,8 @@ func (c *Conn) receiveIPv6() conn.ReceiveFunc {
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
 // The provided healthItem and metrics are updated if non-nil.
 func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFuncStats, packetMetric, bytesMetric *expvar.Int) conn.ReceiveFunc {
-	// epCache caches an IPPort->endpoint for hot flows.
-	var epCache ippEndpointCache
+	// epCache caches an epAddr->endpoint for hot flows.
+	var epCache epAddrEndpointCache
 
 	return func(buffs [][]byte, sizes []int, eps []conn.Endpoint) (_ int, retErr error) {
 		if healthItem != nil {
@@ -1514,7 +1522,7 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 					continue
 				}
 				ipp := msg.Addr.(*net.UDPAddr).AddrPort()
-				if ep, ok := c.receiveIP(msg.Buffers[0][:msg.N], ipp, &epCache); ok {
+				if ep, size, ok := c.receiveIP(msg.Buffers[0][:msg.N], ipp, &epCache); ok {
 					if packetMetric != nil {
 						packetMetric.Add(1)
 					}
@@ -1522,7 +1530,7 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 						bytesMetric.Add(int64(msg.N))
 					}
 					eps[i] = ep
-					sizes[i] = msg.N
+					sizes[i] = size
 					reportToCaller = true
 				} else {
 					sizes[i] = 0
@@ -1537,47 +1545,89 @@ func (c *Conn) mkReceiveFunc(ruc *RebindingUDPConn, healthItem *health.ReceiveFu
 
 // receiveIP is the shared bits of ReceiveIPv4 and ReceiveIPv6.
 //
+// size is the length of 'b' to report up to wireguard-go (only relevant if
+// 'ok' is true)
+//
 // ok is whether this read should be reported up to wireguard-go (our
 // caller).
-func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *ippEndpointCache) (_ conn.Endpoint, ok bool) {
+func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCache) (_ conn.Endpoint, size int, ok bool) {
 	var ep *endpoint
-	if stun.Is(b) {
+	size = len(b)
+
+	var geneve packet.GeneveHeader
+	pt, isGeneveEncap := packetLooksLike(b)
+	src := epAddr{ap: ipp}
+	if isGeneveEncap {
+		err := geneve.Decode(b)
+		if err != nil {
+			// Decode only returns an error when 'b' is too short, and
+			// 'isGeneveEncap' indicates it's a sufficient length.
+			c.logf("[unexpected] geneve header decoding error: %v", err)
+			return nil, 0, false
+		}
+		src.vni.set(geneve.VNI)
+	}
+	switch pt {
+	case packetLooksLikeDisco:
+		if isGeneveEncap {
+			b = b[packet.GeneveFixedHeaderLength:]
+		}
+		// The Geneve header control bit should only be set for relay handshake
+		// messages terminating on or originating from a UDP relay server. We
+		// have yet to open the encrypted disco payload to determine the
+		// [disco.MessageType], but we assert it should be handshake-related.
+		shouldByRelayHandshakeMsg := geneve.Control == true
+		c.handleDiscoMessage(b, src, shouldByRelayHandshakeMsg, key.NodePublic{}, discoRXPathUDP)
+		return nil, 0, false
+	case packetLooksLikeSTUNBinding:
 		c.netChecker.ReceiveSTUNPacket(b, ipp)
-		return nil, false
+		return nil, 0, false
+	default:
+		// Fall through for all other packet types as they are assumed to
+		// be potentially WireGuard.
 	}
-	if c.handleDiscoMessage(b, ipp, key.NodePublic{}, discoRXPathUDP) {
-		return nil, false
-	}
+
 	if !c.havePrivateKey.Load() {
 		// If we have no private key, we're logged out or
 		// stopped. Don't try to pass these wireguard packets
 		// up to wireguard-go; it'll just complain (issue 1167).
-		return nil, false
+		return nil, 0, false
 	}
-	if cache.ipp == ipp && cache.de != nil && cache.gen == cache.de.numStopAndReset() {
+
+	if src.vni.isSet() {
+		// Strip away the Geneve header before returning the packet to
+		// wireguard-go.
+		//
+		// TODO(jwhited): update [github.com/tailscale/wireguard-go/conn.ReceiveFunc]
+		//  to support returning start offset in order to get rid of this memmove perf
+		//  penalty.
+		size = copy(b, b[packet.GeneveFixedHeaderLength:])
+	}
+
+	if cache.epAddr == src && cache.de != nil && cache.gen == cache.de.numStopAndReset() {
 		ep = cache.de
 	} else {
 		c.mu.Lock()
-		de, ok := c.peerMap.endpointForIPPort(ipp)
+		de, ok := c.peerMap.endpointForEpAddr(src)
 		c.mu.Unlock()
 		if !ok {
 			if c.controlKnobs != nil && c.controlKnobs.DisableCryptorouting.Load() {
-				return nil, false
+				return nil, 0, false
 			}
-			return &lazyEndpoint{c: c, src: ipp}, true
+			return &lazyEndpoint{c: c, src: src}, size, true
 		}
-		cache.ipp = ipp
+		cache.epAddr = src
 		cache.de = de
 		cache.gen = de.numStopAndReset()
 		ep = de
 	}
 	now := mono.Now()
 	ep.lastRecvUDPAny.StoreAtomic(now)
-	ep.noteRecvActivity(ipp, now)
+	ep.noteRecvActivity(src, now)
 	if stats := c.stats.Load(); stats != nil {
 		stats.UpdateRxPhysical(ep.nodeAddr, ipp, 1, len(b))
 	}
-	return ep, true
+	return ep, size, true
 }
 
 // discoLogLevel controls the verbosity of discovery log messages.
@@ -1598,16 +1648,52 @@ const (
 // speeds.
 var debugIPv4DiscoPingPenalty = envknob.RegisterDuration("TS_DISCO_PONG_IPV4_DELAY")
 
+// virtualNetworkID is a Geneve header (RFC8926) 3-byte virtual network
+// identifier. Its field must only ever be accessed via its methods.
+type virtualNetworkID struct {
+	_vni uint32
+}
+
+const (
+	vniSetMask uint32 = 0xFF000000
+	vniGetMask uint32 = ^vniSetMask
+)
+
+// isSet returns true if set() had been called previously, otherwise false.
+func (v *virtualNetworkID) isSet() bool {
+	return v._vni&vniSetMask != 0
+}
+
+// set sets the provided VNI. If VNI exceeds the 3-byte storage it will be
+// clamped.
+func (v *virtualNetworkID) set(vni uint32) {
+	v._vni = vni | vniSetMask
+}
+
+// get returns the VNI value.
+func (v *virtualNetworkID) get() uint32 {
+	return v._vni & vniGetMask
+}
+
 // sendDiscoMessage sends discovery message m to dstDisco at dst.
 //
-// If dst is a DERP IP:port, then dstKey must be non-zero.
+// If dst.ap is a DERP IP:port, then dstKey must be non-zero.
+//
+// If dst.vni.isSet(), the [disco.Message] will be preceded by a Geneve header
+// with the VNI field set to the value returned by vni.get().
 //
 // The dstKey should only be non-zero if the dstDisco key
 // unambiguously maps to exactly one peer.
-func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
-	isDERP := dst.Addr() == tailcfg.DerpMagicIPAddr
-	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.Addr().Is4() {
+func (c *Conn) sendDiscoMessage(dst epAddr, dstKey key.NodePublic, dstDisco key.DiscoPublic, m disco.Message, logLevel discoLogLevel) (sent bool, err error) {
+	isDERP := dst.ap.Addr() == tailcfg.DerpMagicIPAddr
+	if _, isPong := m.(*disco.Pong); isPong && !isDERP && dst.ap.Addr().Is4() {
 		time.Sleep(debugIPv4DiscoPingPenalty())
+	}
+
+	isRelayHandshakeMsg := false
+	switch m.(type) {
+	case *disco.BindUDPRelayEndpoint, *disco.BindUDPRelayEndpointAnswer:
+		isRelayHandshakeMsg = true
 	}
 
 	c.mu.Lock()
@@ -1615,11 +1701,43 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 		c.mu.Unlock()
 		return false, errConnClosed
 	}
+	var di *discoInfo
+	switch {
+	case isRelayHandshakeMsg:
+		var ok bool
+		di, ok = c.relayManager.discoInfo(dstDisco)
+		if !ok {
+			c.mu.Unlock()
+			return false, errors.New("unknown relay server")
+		}
+	case c.peerMap.knownPeerDiscoKey(dstDisco):
+		di = c.discoInfoForKnownPeerLocked(dstDisco)
+	default:
+		// This is an attempt to send to an unknown peer that is not a relay
+		// server. This can happen when a call to the current function, which is
+		// often via a new goroutine, races with applying a change in the
+		// netmap, e.g. the associated peer(s) for dstDisco goes away.
+		c.mu.Unlock()
+		return false, errors.New("unknown peer")
+	}
+	c.mu.Unlock()
+
 	pkt := make([]byte, 0, 512) // TODO: size it correctly? pool? if it matters.
+	if dst.vni.isSet() {
+		gh := packet.GeneveHeader{
+			Version:  0,
+			Protocol: packet.GeneveProtocolDisco,
+			VNI:      dst.vni.get(),
+			Control:  isRelayHandshakeMsg,
+		}
+		pkt = append(pkt, make([]byte, packet.GeneveFixedHeaderLength)...)
+		err := gh.Encode(pkt)
+		if err != nil {
+			return false, err
+		}
+	}
 	pkt = append(pkt, disco.Magic...)
 	pkt = c.discoPublic.AppendTo(pkt)
-	di := c.discoInfoLocked(dstDisco)
-	c.mu.Unlock()
 
 	if isDERP {
 		metricSendDiscoDERP.Add(1)
@@ -1630,7 +1748,7 @@ func (c *Conn) sendDiscoMessage(dst netip.AddrPort, dstKey key.NodePublic, dstDi
 	box := di.sharedKey.Seal(m.AppendMarshal(nil))
 	pkt = append(pkt, box...)
 	const isDisco = true
-	sent, err = c.sendAddr(dst, dstKey, pkt, isDisco)
+	sent, err = c.sendAddr(dst.ap, dstKey, pkt, isDisco)
 	if sent {
 		if logLevel == discoLog || (logLevel == discoVerboseLog && debugDisco()) {
 			node := "?"
@@ -1670,8 +1788,98 @@ const (
 	discoRXPathRawSocket discoRXPath = "raw socket"
 )
 
-// handleDiscoMessage handles a discovery message and reports whether
-// msg was a Tailscale inter-node discovery message.
+const discoHeaderLen = len(disco.Magic) + key.DiscoPublicRawLen
+
+type packetLooksLikeType int
+
+const (
+	packetLooksLikeWireGuard packetLooksLikeType = iota
+	packetLooksLikeSTUNBinding
+	packetLooksLikeDisco
+)
+
+// packetLooksLike reports a [packetsLooksLikeType] for 'msg', and whether
+// 'msg' is encapsulated by a Geneve header (or naked).
+//
+// [packetLooksLikeSTUNBinding] is never Geneve-encapsulated.
+//
+// Naked STUN binding, Naked Disco, Geneve followed by Disco, naked WireGuard,
+// and Geneve followed by WireGuard can be confidently distinguished based on
+// the following:
+//
+//  1. STUN binding @ msg[1] (0x01) is sufficiently non-overlapping with the
+//     Geneve header where the LSB is always 0 (part of 6 "reserved" bits).
+//
+//  2. STUN binding @ msg[1] (0x01) is sufficiently non-overlapping with naked
+//     WireGuard, which is always a 0 byte value (WireGuard message type
+//     occupies msg[0:4], and msg[1:4] are always 0).
+//
+//  3. STUN binding @ msg[1] (0x01) is sufficiently non-overlapping with the
+//     second byte of [disco.Magic] (0x53).
+//
+//  4. [disco.Magic] @ msg[2:4] (0xf09f) is sufficiently non-overlapping with a
+//     Geneve protocol field value of [packet.GeneveProtocolDisco] or
+//     [packet.GeneveProtocolWireGuard] .
+//
+//  5. [disco.Magic] @ msg[0] (0x54) is sufficiently non-overlapping with the
+//     first byte of a WireGuard packet (0x01-0x04).
+//
+//  6. [packet.GeneveHeader] with a Geneve protocol field value of
+//     [packet.GeneveProtocolDisco] or [packet.GeneveProtocolWireGuard]
+//     (msg[2:4]) is sufficiently non-overlapping with the second 2 bytes of a
+//     WireGuard packet which are always 0x0000.
+func packetLooksLike(msg []byte) (t packetLooksLikeType, isGeneveEncap bool) {
+	if stun.Is(msg) &&
+		msg[1] == 0x01 { // method binding
+		return packetLooksLikeSTUNBinding, false
+	}
+
+	// TODO(jwhited): potentially collapse into disco.LooksLikeDiscoWrapper()
+	//  if safe to do so.
+	looksLikeDisco := func(msg []byte) bool {
+		if len(msg) >= discoHeaderLen && string(msg[:len(disco.Magic)]) == disco.Magic {
+			return true
+		}
+		return false
+	}
+
+	// Do we have a Geneve header?
+	if len(msg) >= packet.GeneveFixedHeaderLength &&
+		msg[0]&0xC0 == 0 && // version bits that we always transmit as 0s
+		msg[1]&0x3F == 0 && // reserved bits that we always transmit as 0s
+		msg[7] == 0 { // reserved byte that we always transmit as 0
+		switch binary.BigEndian.Uint16(msg[2:4]) {
+		case packet.GeneveProtocolDisco:
+			if looksLikeDisco(msg[packet.GeneveFixedHeaderLength:]) {
+				return packetLooksLikeDisco, true
+			} else {
+				// The Geneve header is well-formed, and it indicated this
+				// was disco, but it's not. The evaluated bytes at this point
+				// are always distinct from naked WireGuard (msg[2:4] are always
+				// 0x0000) and naked Disco (msg[2:4] are always 0xf09f), but
+				// maintain pre-Geneve behavior and fall back to assuming it's
+				// naked WireGuard.
+				return packetLooksLikeWireGuard, false
+			}
+		case packet.GeneveProtocolWireGuard:
+			return packetLooksLikeWireGuard, true
+		default:
+			// The Geneve header is well-formed, but the protocol field value is
+			// unknown to us. The evaluated bytes at this point are not
+			// necessarily distinct from naked WireGuard or naked Disco, fall
+			// through.
+		}
+	}
+
+	if looksLikeDisco(msg) {
+		return packetLooksLikeDisco, false
+	} else {
+		return packetLooksLikeWireGuard, false
+	}
+}
+
+// handleDiscoMessage handles a discovery message. The caller is assumed to have
+// verified 'msg' returns [packetLooksLikeDisco] from packetLooksLike().
 //
 // A discovery message has the form:
 //
@@ -1680,23 +1888,18 @@ const (
 //   - nonce             [24]byte
 //   - naclbox of payload (see tailscale.com/disco package for inner payload format)
 //
-// For messages received over DERP, the src.Addr() will be derpMagicIP (with
-// src.Port() being the region ID) and the derpNodeSrc will be the node key
+// For messages received over DERP, the src.ap.Addr() will be derpMagicIP (with
+// src.ap.Port() being the region ID) and the derpNodeSrc will be the node key
 // it was received from at the DERP layer. derpNodeSrc is zero when received
 // over UDP.
-func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc key.NodePublic, via discoRXPath) (isDiscoMsg bool) {
-	const headerLen = len(disco.Magic) + key.DiscoPublicRawLen
-	if len(msg) < headerLen || string(msg[:len(disco.Magic)]) != disco.Magic {
-		return false
-	}
-
-	// If the first four parts are the prefix of disco.Magic
-	// (0x5453f09f) then it's definitely not a valid WireGuard
-	// packet (which starts with little-endian uint32 1, 2, 3, 4).
-	// Use naked returns for all following paths.
-	isDiscoMsg = true
-
-	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):headerLen]))
+//
+// If 'msg' was encapsulated by a Geneve header it is assumed to have already
+// been stripped.
+//
+// 'shouldBeRelayHandshakeMsg' will be true if 'msg' was encapsulated
+// by a Geneve header with the control bit set.
+func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshakeMsg bool, derpNodeSrc key.NodePublic, via discoRXPath) {
+	sender := key.DiscoPublicFromRaw32(mem.B(msg[len(disco.Magic):discoHeaderLen]))
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1709,11 +1912,23 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	}
 	if c.privateKey.IsZero() {
 		// Ignore disco messages when we're stopped.
-		// Still return true, to not pass it down to wireguard.
 		return
 	}
 
-	if !c.peerMap.knownPeerDiscoKey(sender) {
+	var di *discoInfo
+	switch {
+	case shouldBeRelayHandshakeMsg:
+		var ok bool
+		di, ok = c.relayManager.discoInfo(sender)
+		if !ok {
+			if debugDisco() {
+				c.logf("magicsock: disco: ignoring disco-looking relay handshake frame, no active handshakes with key %v over %v", sender.ShortString(), src)
+			}
+			return
+		}
+	case c.peerMap.knownPeerDiscoKey(sender):
+		di = c.discoInfoForKnownPeerLocked(sender)
+	default:
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
 			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
@@ -1721,26 +1936,22 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	isDERP := src.Addr() == tailcfg.DerpMagicIPAddr
-	if !isDERP {
+	isDERP := src.ap.Addr() == tailcfg.DerpMagicIPAddr
+	if !isDERP && !shouldBeRelayHandshakeMsg {
 		// Record receive time for UDP transport packets.
-		pi, ok := c.peerMap.byIPPort[src]
+		pi, ok := c.peerMap.byEpAddr[src]
 		if ok {
 			pi.ep.lastRecvUDPAny.StoreAtomic(mono.Now())
 		}
 	}
 
-	// We're now reasonably sure we're expecting communication from
-	// this peer, do the heavy crypto lifting to see what they want.
-	//
-	// From here on, peerNode and de are non-nil.
+	// We're now reasonably sure we're expecting communication from 'sender',
+	// do the heavy crypto lifting to see what they want.
 
-	di := c.discoInfoLocked(sender)
-
-	sealedBox := msg[headerLen:]
+	sealedBox := msg[discoHeaderLen:]
 	payload, ok := di.sharedKey.Open(sealedBox)
 	if !ok {
-		// This might be have been intended for a previous
+		// This might have been intended for a previous
 		// disco key.  When we restart we get a new disco key
 		// and old packets might've still been in flight (or
 		// scheduled). This is particularly the case for LANs
@@ -1760,7 +1971,8 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 	// Emit information about the disco frame into the pcap stream
 	// if a capture hook is installed.
 	if cb := c.captureHook.Load(); cb != nil {
-		cb(packet.PathDisco, time.Now(), disco.ToPCAPFrame(src, derpNodeSrc, payload), packet.CaptureMeta{})
+		// TODO(jwhited): include VNI context?
+		cb(packet.PathDisco, time.Now(), disco.ToPCAPFrame(src.ap, derpNodeSrc, payload), packet.CaptureMeta{})
 	}
 
 	dm, err := disco.Parse(payload)
@@ -1783,6 +1995,19 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		metricRecvDiscoUDP.Add(1)
 	}
 
+	if shouldBeRelayHandshakeMsg {
+		challenge, ok := dm.(*disco.BindUDPRelayEndpointChallenge)
+		if !ok {
+			// We successfully parsed the disco message, but it wasn't a
+			// challenge. We should never receive other message types
+			// from a relay server with the Geneve header control bit set.
+			c.logf("[unexpected] %T packets should not come from a relay server with Geneve control bit set", dm)
+			return
+		}
+		c.relayManager.handleGeneveEncapDiscoMsgNotBestAddr(challenge, di, src)
+		return
+	}
+
 	switch dm := dm.(type) {
 	case *disco.Ping:
 		metricRecvDiscoPing.Add(1)
@@ -1792,24 +2017,46 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		// There might be multiple nodes for the sender's DiscoKey.
 		// Ask each to handle it, stopping once one reports that
 		// the Pong's TxID was theirs.
+		knownTxID := false
 		c.peerMap.forEachEndpointWithDiscoKey(sender, func(ep *endpoint) (keepGoing bool) {
 			if ep.handlePongConnLocked(dm, di, src) {
+				knownTxID = true
 				return false
 			}
 			return true
 		})
-	case *disco.CallMeMaybe:
+		if !knownTxID && src.vni.isSet() {
+			c.relayManager.handleGeneveEncapDiscoMsgNotBestAddr(dm, di, src)
+		}
+	case *disco.CallMeMaybe, *disco.CallMeMaybeVia:
+		var via *disco.CallMeMaybeVia
+		isVia := false
+		msgType := "CallMeMaybe"
+		cmm, ok := dm.(*disco.CallMeMaybe)
+		if !ok {
+			via = dm.(*disco.CallMeMaybeVia)
+			msgType = "CallMeMaybeVia"
+			isVia = true
+		}
+
 		metricRecvDiscoCallMeMaybe.Add(1)
 		if !isDERP || derpNodeSrc.IsZero() {
-			// CallMeMaybe messages should only come via DERP.
-			c.logf("[unexpected] CallMeMaybe packets should only come via DERP")
+			// CallMeMaybe{Via} messages should only come via DERP.
+			c.logf("[unexpected] %s packets should only come via DERP", msgType)
 			return
 		}
 		nodeKey := derpNodeSrc
 		ep, ok := c.peerMap.endpointForNodeKey(nodeKey)
 		if !ok {
 			metricRecvDiscoCallMeMaybeBadNode.Add(1)
-			c.logf("magicsock: disco: ignoring CallMeMaybe from %v; %v is unknown", sender.ShortString(), derpNodeSrc.ShortString())
+			c.logf("magicsock: disco: ignoring %s from %v; %v is unknown", msgType, sender.ShortString(), derpNodeSrc.ShortString())
+			return
+		}
+		ep.mu.Lock()
+		relayCapable := ep.relayCapable
+		ep.mu.Unlock()
+		if isVia && !relayCapable {
+			c.logf("magicsock: disco: ignoring %s from %v; %v is not known to be relay capable", msgType, sender.ShortString(), sender.ShortString())
 			return
 		}
 		epDisco := ep.disco.Load()
@@ -1818,14 +2065,23 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		}
 		if epDisco.key != di.discoKey {
 			metricRecvDiscoCallMeMaybeBadDisco.Add(1)
-			c.logf("[unexpected] CallMeMaybe from peer via DERP whose netmap discokey != disco source")
+			c.logf("[unexpected] %s from peer via DERP whose netmap discokey != disco source", msgType)
 			return
 		}
-		c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got call-me-maybe, %d endpoints",
-			c.discoShort, epDisco.short,
-			ep.publicKey.ShortString(), derpStr(src.String()),
-			len(dm.MyNumber))
-		go ep.handleCallMeMaybe(dm)
+		if isVia {
+			c.dlogf("[v1] magicsock: disco: %v<-%v via %v (%v, %v)  got call-me-maybe-via, %d endpoints",
+				c.discoShort, epDisco.short, via.ServerDisco.ShortString(),
+				ep.publicKey.ShortString(), derpStr(src.String()),
+				len(via.AddrPorts))
+			c.relayManager.handleCallMeMaybeVia(ep, via)
+		} else {
+			c.dlogf("[v1] magicsock: disco: %v<-%v (%v, %v)  got call-me-maybe, %d endpoints",
+				c.discoShort, epDisco.short,
+				ep.publicKey.ShortString(), derpStr(src.String()),
+				len(cmm.MyNumber))
+			go ep.handleCallMeMaybe(cmm)
+		}
+
 	}
 	return
 }
@@ -1870,25 +2126,16 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 
 // di is the discoInfo of the source of the ping.
 // derpNodeSrc is non-zero if the ping arrived via DERP.
-func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInfo, derpNodeSrc key.NodePublic) {
+func (c *Conn) handlePingLocked(dm *disco.Ping, src epAddr, di *discoInfo, derpNodeSrc key.NodePublic) {
 	likelyHeartBeat := src == di.lastPingFrom && time.Since(di.lastPingTime) < 5*time.Second
 	di.lastPingFrom = src
 	di.lastPingTime = time.Now()
-	isDerp := src.Addr() == tailcfg.DerpMagicIPAddr
+	isDerp := src.ap.Addr() == tailcfg.DerpMagicIPAddr
 
-	// If we can figure out with certainty which node key this disco
-	// message is for, eagerly update our IP<>node and disco<>node
-	// mappings to make p2p path discovery faster in simple
-	// cases. Without this, disco would still work, but would be
-	// reliant on DERP call-me-maybe to establish the disco<>node
-	// mapping, and on subsequent disco handlePongConnLocked to establish
-	// the IP<>disco mapping.
-	if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
-		if !isDerp {
-			c.peerMap.setNodeKeyForIPPort(src, nk)
-		}
-	}
-
+	// numNodes tracks how many nodes (node keys) are associated with the disco
+	// key tied to this inbound ping. Multiple nodes may share the same disco
+	// key in the case of node sharing and users switching accounts.
+	var numNodes int
 	// If we got a ping over DERP, then derpNodeSrc is non-zero and we reply
 	// over DERP (in which case ipDst is also a DERP address).
 	// But if the ping was over UDP (ipDst is not a DERP address), then dstKey
@@ -1896,35 +2143,81 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 	// a dstKey if the dst ip:port is DERP.
 	dstKey := derpNodeSrc
 
-	// Remember this route if not present.
-	var numNodes int
-	var dup bool
-	if isDerp {
-		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
-			if ep.addCandidateEndpoint(src, dm.TxID) {
-				return
-			}
-			numNodes = 1
-		}
-	} else {
-		c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) (keepGoing bool) {
-			if ep.addCandidateEndpoint(src, dm.TxID) {
-				dup = true
-				return false
-			}
-			numNodes++
-			if numNodes == 1 && dstKey.IsZero() {
-				dstKey = ep.publicKey
-			}
-			return true
-		})
-		if dup {
+	switch {
+	case src.vni.isSet():
+		if isDerp {
+			c.logf("[unexpected] got Geneve-encapsulated disco ping from %v/%v over DERP", src, derpNodeSrc)
 			return
 		}
-		if numNodes > 1 {
-			// Zero it out if it's ambiguous, so sendDiscoMessage logging
-			// isn't confusing.
-			dstKey = key.NodePublic{}
+
+		var bestEpAddr epAddr
+		var discoKey key.DiscoPublic
+		ep, ok := c.peerMap.endpointForEpAddr(src)
+		if ok {
+			ep.mu.Lock()
+			bestEpAddr = ep.bestAddr.epAddr
+			ep.mu.Unlock()
+			disco := ep.disco.Load()
+			if disco != nil {
+				discoKey = disco.key
+			}
+		}
+
+		if src == bestEpAddr && discoKey == di.discoKey {
+			// We have an associated endpoint with src as its bestAddr. Set
+			// numNodes so we TX a pong further down.
+			numNodes = 1
+		} else {
+			// We have no [endpoint] in the [peerMap] for this relay [epAddr]
+			// using it as a bestAddr. [relayManager] might be in the middle of
+			// probing it or attempting to set it as best via
+			// [endpoint.relayEndpointReady()]. Make [relayManager] aware.
+			c.relayManager.handleGeneveEncapDiscoMsgNotBestAddr(dm, di, src)
+			return
+		}
+	default: // no VNI
+		// If we can figure out with certainty which node key this disco
+		// message is for, eagerly update our [epAddr]<>node and disco<>node
+		// mappings to make p2p path discovery faster in simple
+		// cases. Without this, disco would still work, but would be
+		// reliant on DERP call-me-maybe to establish the disco<>node
+		// mapping, and on subsequent disco handlePongConnLocked to establish
+		// the IP:port<>disco mapping.
+		if nk, ok := c.unambiguousNodeKeyOfPingLocked(dm, di.discoKey, derpNodeSrc); ok {
+			if !isDerp {
+				c.peerMap.setNodeKeyForEpAddr(src, nk)
+			}
+		}
+
+		// Remember this route if not present.
+		var dup bool
+		if isDerp {
+			if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
+				if ep.addCandidateEndpoint(src.ap, dm.TxID) {
+					return
+				}
+				numNodes = 1
+			}
+		} else {
+			c.peerMap.forEachEndpointWithDiscoKey(di.discoKey, func(ep *endpoint) (keepGoing bool) {
+				if ep.addCandidateEndpoint(src.ap, dm.TxID) {
+					dup = true
+					return false
+				}
+				numNodes++
+				if numNodes == 1 && dstKey.IsZero() {
+					dstKey = ep.publicKey
+				}
+				return true
+			})
+			if dup {
+				return
+			}
+			if numNodes > 1 {
+				// Zero it out if it's ambiguous, so sendDiscoMessage logging
+				// isn't confusing.
+				dstKey = key.NodePublic{}
+			}
 		}
 	}
 
@@ -1945,7 +2238,7 @@ func (c *Conn) handlePingLocked(dm *disco.Ping, src netip.AddrPort, di *discoInf
 	discoDest := di.discoKey
 	go c.sendDiscoMessage(ipDst, dstKey, discoDest, &disco.Pong{
 		TxID: dm.TxID,
-		Src:  src,
+		Src:  src.ap,
 	}, discoVerboseLog)
 }
 
@@ -1988,19 +2281,24 @@ func (c *Conn) enqueueCallMeMaybe(derpAddr netip.AddrPort, de *endpoint) {
 	for _, ep := range c.lastEndpoints {
 		eps = append(eps, ep.Addr)
 	}
-	go de.c.sendDiscoMessage(derpAddr, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+	go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, de.publicKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	if debugSendCallMeUnknownPeer() {
 		// Send a callMeMaybe packet to a non-existent peer
 		unknownKey := key.NewNode().Public()
 		c.logf("magicsock: sending CallMeMaybe to unknown peer per TS_DEBUG_SEND_CALLME_UNKNOWN_PEER")
-		go de.c.sendDiscoMessage(derpAddr, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
+		go de.c.sendDiscoMessage(epAddr{ap: derpAddr}, unknownKey, epDisco.key, &disco.CallMeMaybe{MyNumber: eps}, discoLog)
 	}
 }
 
-// discoInfoLocked returns the previous or new discoInfo for k.
+// discoInfoForKnownPeerLocked returns the previous or new discoInfo for k.
+//
+// Callers must only pass key.DiscoPublic's that are present in and
+// lifetime-managed via [Conn].peerMap. UDP relay server disco keys are discovered
+// at relay endpoint allocation time or [disco.CallMeMaybeVia] reception time
+// and therefore must never pass through this method.
 //
 // c.mu must be held.
-func (c *Conn) discoInfoLocked(k key.DiscoPublic) *discoInfo {
+func (c *Conn) discoInfoForKnownPeerLocked(k key.DiscoPublic) *discoInfo {
 	di, ok := c.discoInfo[k]
 	if !ok {
 		di = &discoInfo{
@@ -2207,6 +2505,11 @@ func (c *Conn) SetProbeUDPLifetime(v bool) {
 	c.peerMap.forEachEndpoint(func(ep *endpoint) {
 		ep.setProbeUDPLifetimeOn(v)
 	})
+}
+
+func capVerIsRelayCapable(version tailcfg.CapabilityVersion) bool {
+	// TODO(jwhited): implement once capVer is bumped
+	return false
 }
 
 // SetNetworkMap is called when the control client gets a new network
@@ -2905,6 +3208,10 @@ func (c *Conn) UpdateNetmapDelta(muts []netmap.NodeMutation) (handled bool) {
 			ep.mu.Lock()
 			ep.setEndpointsLocked(views.SliceOf(m.Endpoints))
 			ep.mu.Unlock()
+		case netmap.NodeMutationCap:
+			ep.mu.Lock()
+			ep.relayCapable = capVerIsRelayCapable(m.Cap)
+			ep.mu.Unlock()
 		}
 	}
 	return true
@@ -3084,12 +3391,12 @@ func portableTrySetSocketBuffer(pconn nettype.PacketConn, logf logger.Logf) {
 // derpStr replaces DERP IPs in s with "derp-".
 func derpStr(s string) string { return strings.ReplaceAll(s, "127.3.3.40:", "derp-") }
 
-// ippEndpointCache is a mutex-free single-element cache, mapping from
-// a single netip.AddrPort to a single endpoint.
-type ippEndpointCache struct {
-	ipp netip.AddrPort
-	gen int64
-	de  *endpoint
+// epAddrEndpointCache is a mutex-free single-element cache, mapping from
+// a single [epAddr] to a single [*endpoint].
+type epAddrEndpointCache struct {
+	epAddr epAddr
+	gen    int64
+	de     *endpoint
 }
 
 // discoInfo is the info and state for the DiscoKey
@@ -3118,7 +3425,7 @@ type discoInfo struct {
 	// Mutable fields follow, owned by Conn.mu:
 
 	// lastPingFrom is the src of a ping for discoKey.
-	lastPingFrom netip.AddrPort
+	lastPingFrom epAddr
 
 	// lastPingTime is the last time of a ping for discoKey.
 	lastPingTime time.Time
@@ -3253,14 +3560,14 @@ func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netchec
 // to tell us who it is later and get the correct conn.Endpoint.
 type lazyEndpoint struct {
 	c   *Conn
-	src netip.AddrPort
+	src epAddr
 }
 
 var _ conn.PeerAwareEndpoint = (*lazyEndpoint)(nil)
 var _ conn.Endpoint = (*lazyEndpoint)(nil)
 
 func (le *lazyEndpoint) ClearSrc()           {}
-func (le *lazyEndpoint) SrcIP() netip.Addr   { return le.src.Addr() }
+func (le *lazyEndpoint) SrcIP() netip.Addr   { return le.src.ap.Addr() }
 func (le *lazyEndpoint) DstIP() netip.Addr   { return netip.Addr{} }
 func (le *lazyEndpoint) SrcToString() string { return le.src.String() }
 func (le *lazyEndpoint) DstToString() string { return "dst" }

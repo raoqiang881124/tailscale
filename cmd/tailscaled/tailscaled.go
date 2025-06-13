@@ -573,7 +573,7 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 		if ms, ok := sys.MagicSock.GetOK(); ok {
 			debugMux.HandleFunc("/debug/magicsock", ms.ServeHTTPDebug)
 		}
-		go runDebugServer(debugMux, args.debug)
+		go runDebugServer(logf, debugMux, args.debug)
 	}
 
 	ns, err := newNetstack(logf, sys)
@@ -660,7 +660,6 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 		Socket:        args.socketpath,
 		UseSocketOnly: args.socketpath != paths.DefaultTailscaledSocket(),
 	})
-	configureTaildrop(logf, lb)
 	if err := ns.Start(lb); err != nil {
 		log.Fatalf("failed to start netstack: %v", err)
 	}
@@ -720,6 +719,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
+		EventBus:      sys.Bus.Get(),
 		DriveForLocal: driveimpl.NewFileSystemForLocal(logf),
 	}
 
@@ -819,12 +819,20 @@ func servePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
 	clientmetric.WritePrometheusExpositionFormat(w)
 }
 
-func runDebugServer(mux *http.ServeMux, addr string) {
+func runDebugServer(logf logger.Logf, mux *http.ServeMux, addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("debug server: %v", err)
+	}
+	if strings.HasSuffix(addr, ":0") {
+		// Log kernel-selected port number so integration tests
+		// can find it portably.
+		logf("DEBUG-ADDR=%v", ln.Addr())
+	}
 	srv := &http.Server{
-		Addr:    addr,
 		Handler: mux,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+	if err := srv.Serve(ln); err != nil {
 		log.Fatal(err)
 	}
 }
