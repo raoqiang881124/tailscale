@@ -5,8 +5,6 @@ package udprelay
 
 import (
 	"bytes"
-	"encoding/json"
-	"math"
 	"net"
 	"net/netip"
 	"testing"
@@ -17,7 +15,6 @@ import (
 	"go4.org/mem"
 	"tailscale.com/disco"
 	"tailscale.com/net/packet"
-	"tailscale.com/tstime"
 	"tailscale.com/types/key"
 )
 
@@ -159,7 +156,7 @@ func TestServer(t *testing.T) {
 
 	ipv4LoopbackAddr := netip.MustParseAddr("127.0.0.1")
 
-	server, _, err := NewServer(0, []netip.Addr{ipv4LoopbackAddr})
+	server, _, err := NewServer(t.Logf, 0, []netip.Addr{ipv4LoopbackAddr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,8 +171,7 @@ func TestServer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// We expect the same endpoint details as the 3-way bind handshake has not
-	// yet been completed for both relay client parties.
+	// We expect the same endpoint details pre-handshake.
 	if diff := cmp.Diff(dupEndpoint, endpoint, cmpopts.EquateComparable(netip.AddrPort{}, key.DiscoPublic{})); diff != "" {
 		t.Fatalf("wrong dupEndpoint (-got +want)\n%s", diff)
 	}
@@ -191,6 +187,15 @@ func TestServer(t *testing.T) {
 	tcA.handshake(t)
 	tcB.handshake(t)
 
+	dupEndpoint, err = server.AllocateEndpoint(discoA.Public(), discoB.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// We expect the same endpoint details post-handshake.
+	if diff := cmp.Diff(dupEndpoint, endpoint, cmpopts.EquateComparable(netip.AddrPort{}, key.DiscoPublic{})); diff != "" {
+		t.Fatalf("wrong dupEndpoint (-got +want)\n%s", diff)
+	}
+
 	txToB := []byte{1, 2, 3}
 	tcA.writeDataPkt(t, txToB)
 	rxFromA := tcB.readDataPkt(t)
@@ -203,98 +208,5 @@ func TestServer(t *testing.T) {
 	rxFromB := tcA.readDataPkt(t)
 	if !bytes.Equal(txToA, rxFromB) {
 		t.Fatal("unexpected msg B->A")
-	}
-}
-
-func TestServerEndpointJSONUnmarshal(t *testing.T) {
-	tests := []struct {
-		name    string
-		json    []byte
-		wantErr bool
-	}{
-		{
-			name:    "valid",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"30s","SteadyStateLifetime":"5m0s"}`),
-			wantErr: false,
-		},
-		{
-			name:    "invalid ServerDisco",
-			json:    []byte(`{"ServerDisco":"1","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"30s","SteadyStateLifetime":"5m0s"}`),
-			wantErr: true,
-		},
-		{
-			name:    "invalid LamportID",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":1.1,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"30s","SteadyStateLifetime":"5m0s"}`),
-			wantErr: true,
-		},
-		{
-			name:    "invalid AddrPorts",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"30s","SteadyStateLifetime":"5m0s"}`),
-			wantErr: true,
-		},
-		{
-			name:    "invalid VNI",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":18446744073709551615,"BindLifetime":"30s","SteadyStateLifetime":"5m0s"}`),
-			wantErr: true,
-		},
-		{
-			name:    "invalid BindLifetime",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"5","SteadyStateLifetime":"5m0s"}`),
-			wantErr: true,
-		},
-		{
-			name:    "invalid SteadyStateLifetime",
-			json:    []byte(`{"ServerDisco":"discokey:003cd7453e04a653eb0e7a18f206fc353180efadb2facfd05ebd6982a1392c7f","LamportID":18446744073709551615,"AddrPorts":["127.0.0.1:1","127.0.0.2:2"],"VNI":16777215,"BindLifetime":"30s","SteadyStateLifetime":"5"}`),
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var out ServerEndpoint
-			err := json.Unmarshal(tt.json, &out)
-			if tt.wantErr != (err != nil) {
-				t.Fatalf("wantErr: %v (err == nil): %v", tt.wantErr, err == nil)
-			}
-			if tt.wantErr {
-				return
-			}
-		})
-	}
-}
-
-func TestServerEndpointJSONMarshal(t *testing.T) {
-	tests := []struct {
-		name           string
-		serverEndpoint ServerEndpoint
-	}{
-		{
-			name: "valid roundtrip",
-			serverEndpoint: ServerEndpoint{
-				ServerDisco:         key.NewDisco().Public(),
-				LamportID:           uint64(math.MaxUint64),
-				AddrPorts:           []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:1"), netip.MustParseAddrPort("127.0.0.2:2")},
-				VNI:                 1<<24 - 1,
-				BindLifetime:        tstime.GoDuration{Duration: defaultBindLifetime},
-				SteadyStateLifetime: tstime.GoDuration{Duration: defaultSteadyStateLifetime},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			b, err := json.Marshal(&tt.serverEndpoint)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var got ServerEndpoint
-			err = json.Unmarshal(b, &got)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if diff := cmp.Diff(got, tt.serverEndpoint, cmpopts.EquateComparable(netip.AddrPort{}, key.DiscoPublic{})); diff != "" {
-				t.Fatalf("ServerEndpoint unequal (-got +want)\n%s", diff)
-			}
-		})
 	}
 }

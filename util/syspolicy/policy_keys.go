@@ -63,6 +63,14 @@ const (
 	ExitNodeAllowLANAccess    Key = "ExitNodeAllowLANAccess"
 	EnableTailscaleDNS        Key = "UseTailscaleDNSSettings"
 	EnableTailscaleSubnets    Key = "UseTailscaleSubnets"
+
+	// EnableDNSRegistration is a string value that can be set to "always", "never"
+	// or "user-decides". It controls whether DNS registration and dynamic DNS
+	// updates are enabled for the Tailscale interface. For historical reasons
+	// and to maintain compatibility with existing setups, the default is "never".
+	// It is only used on Windows.
+	EnableDNSRegistration Key = "EnableDNSRegistration"
+
 	// CheckUpdates is the key to signal if the updater should periodically
 	// check for updates.
 	CheckUpdates Key = "CheckUpdates"
@@ -118,8 +126,8 @@ const (
 	// The default is "user-decides" unless otherwise stated.
 	PostureChecking Key = "PostureChecking"
 	// DeviceSerialNumber is the serial number of the device that is running Tailscale.
-	// This is used on iOS/tvOS to allow IT administrators to manually give us a serial number via MDM.
-	// We are unable to programmatically get the serial number from IOKit due to sandboxing restrictions.
+	// This is used on Android, iOS and tvOS to allow IT administrators to manually give us a serial number via MDM.
+	// We are unable to programmatically get the serial number on mobile due to sandboxing restrictions.
 	DeviceSerialNumber Key = "DeviceSerialNumber"
 
 	// ManagedByOrganizationName indicates the name of the organization managing the Tailscale
@@ -168,6 +176,7 @@ var implicitDefinitions = []*setting.Definition{
 	setting.NewDefinition(CheckUpdates, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(ControlURL, setting.DeviceSetting, setting.StringValue),
 	setting.NewDefinition(DeviceSerialNumber, setting.DeviceSetting, setting.StringValue),
+	setting.NewDefinition(EnableDNSRegistration, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableIncomingConnections, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableRunExitNode, setting.DeviceSetting, setting.PreferenceOptionValue),
 	setting.NewDefinition(EnableServerMode, setting.DeviceSetting, setting.PreferenceOptionValue),
