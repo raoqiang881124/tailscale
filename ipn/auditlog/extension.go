@@ -16,7 +16,6 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnext"
 	"tailscale.com/tailcfg"
-	"tailscale.com/tsd"
 	"tailscale.com/types/lazy"
 	"tailscale.com/types/logger"
 )
@@ -36,8 +35,6 @@ func init() {
 type extension struct {
 	logf logger.Logf
 
-	// cleanup are functions to call on shutdown.
-	cleanup []func()
 	// store is the log store shared by all loggers.
 	// It is created when the first logger is started.
 	store lazy.SyncValue[LogStore]
@@ -54,7 +51,7 @@ type extension struct {
 
 // newExtension is an [ipnext.NewExtensionFn] that creates a new audit log extension.
 // It is registered with [ipnext.RegisterExtension] if the package is imported.
-func newExtension(logf logger.Logf, _ *tsd.System) (ipnext.Extension, error) {
+func newExtension(logf logger.Logf, _ ipnext.SafeBackend) (ipnext.Extension, error) {
 	return &extension{logf: logger.WithPrefix(logf, featureName+": ")}, nil
 }
 
@@ -66,11 +63,9 @@ func (e *extension) Name() string {
 // Init implements [ipnext.Extension] by registering callbacks and providers
 // for the duration of the extension's lifetime.
 func (e *extension) Init(h ipnext.Host) error {
-	e.cleanup = []func(){
-		h.RegisterControlClientCallback(e.controlClientChanged),
-		h.Profiles().RegisterProfileStateChangeCallback(e.profileChanged),
-		h.RegisterAuditLogProvider(e.getCurrentLogger),
-	}
+	h.Hooks().NewControlClient.Add(e.controlClientChanged)
+	h.Hooks().ProfileStateChange.Add(e.profileChanged)
+	h.Hooks().AuditLoggers.Add(e.getCurrentLogger)
 	return nil
 }
 
@@ -190,9 +185,5 @@ func (e *extension) getCurrentLogger() ipnauth.AuditLogFunc {
 
 // Shutdown implements [ipnlocal.Extension].
 func (e *extension) Shutdown() error {
-	for _, f := range e.cleanup {
-		f()
-	}
-	e.cleanup = nil
 	return nil
 }

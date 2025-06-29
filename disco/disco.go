@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"go4.org/mem"
 	"tailscale.com/types/key"
@@ -47,6 +48,7 @@ const (
 	TypeBindUDPRelayEndpoint          = MessageType(0x04)
 	TypeBindUDPRelayEndpointChallenge = MessageType(0x05)
 	TypeBindUDPRelayEndpointAnswer    = MessageType(0x06)
+	TypeCallMeMaybeVia                = MessageType(0x07)
 )
 
 const v0 = byte(0)
@@ -93,6 +95,8 @@ func Parse(p []byte) (Message, error) {
 		return parseBindUDPRelayEndpointChallenge(ver, p)
 	case TypeBindUDPRelayEndpointAnswer:
 		return parseBindUDPRelayEndpointAnswer(ver, p)
+	case TypeCallMeMaybeVia:
+		return parseCallMeMaybeVia(ver, p)
 	default:
 		return nil, fmt.Errorf("unknown message type 0x%02x", byte(t))
 	}
@@ -317,78 +321,221 @@ const (
 	BindUDPRelayHandshakeStateAnswerReceived
 )
 
-// bindUDPRelayEndpointLen is the length of a marshalled BindUDPRelayEndpoint
-// message, without the message header.
-const bindUDPRelayEndpointLen = BindUDPRelayEndpointChallengeLen
+// bindUDPRelayEndpointCommonLen is the length of a marshalled
+// [BindUDPRelayEndpointCommon], without the message header.
+const bindUDPRelayEndpointCommonLen = 72
+
+// BindUDPRelayChallengeLen is the length of the Challenge field carried in
+// [BindUDPRelayEndpointChallenge] & [BindUDPRelayEndpointAnswer] messages.
+const BindUDPRelayChallengeLen = 32
+
+// BindUDPRelayEndpointCommon contains fields that are common across all 3
+// UDP relay handshake message types. All 4 field values are expected to be
+// consistent for the lifetime of a handshake besides Challenge, which is
+// irrelevant in a [BindUDPRelayEndpoint] message.
+type BindUDPRelayEndpointCommon struct {
+	// VNI is the Geneve header Virtual Network Identifier field value, which
+	// must match this disco-sealed value upon reception. If they are
+	// non-matching it indicates the cleartext Geneve header was tampered with
+	// and/or mangled.
+	VNI uint32
+	// Generation represents the handshake generation. Clients must set a new,
+	// nonzero value at the start of every handshake.
+	Generation uint32
+	// RemoteKey is the disco key of the remote peer participating over this
+	// relay endpoint.
+	RemoteKey key.DiscoPublic
+	// Challenge is set by the server in a [BindUDPRelayEndpointChallenge]
+	// message, and expected to be echoed back by the client in a
+	// [BindUDPRelayEndpointAnswer] message. Its value is irrelevant in a
+	// [BindUDPRelayEndpoint] message, where it simply serves a padding purpose
+	// ensuring all handshake messages are equal in size.
+	Challenge [BindUDPRelayChallengeLen]byte
+}
+
+// encode encodes m in b. b must be at least bindUDPRelayEndpointCommonLen bytes
+// long.
+func (m *BindUDPRelayEndpointCommon) encode(b []byte) {
+	binary.BigEndian.PutUint32(b, m.VNI)
+	b = b[4:]
+	binary.BigEndian.PutUint32(b, m.Generation)
+	b = b[4:]
+	m.RemoteKey.AppendTo(b[:0])
+	b = b[key.DiscoPublicRawLen:]
+	copy(b, m.Challenge[:])
+}
+
+// decode decodes m from b.
+func (m *BindUDPRelayEndpointCommon) decode(b []byte) error {
+	if len(b) < bindUDPRelayEndpointCommonLen {
+		return errShort
+	}
+	m.VNI = binary.BigEndian.Uint32(b)
+	b = b[4:]
+	m.Generation = binary.BigEndian.Uint32(b)
+	b = b[4:]
+	m.RemoteKey = key.DiscoPublicFromRaw32(mem.B(b[:key.DiscoPublicRawLen]))
+	b = b[key.DiscoPublicRawLen:]
+	copy(m.Challenge[:], b[:BindUDPRelayChallengeLen])
+	return nil
+}
 
 // BindUDPRelayEndpoint is the first messaged transmitted from UDP relay client
-// towards UDP relay server as part of the 3-way bind handshake. It is padded to
-// match the length of BindUDPRelayEndpointChallenge. This message type is
-// currently considered experimental and is not yet tied to a
+// towards UDP relay server as part of the 3-way bind handshake. This message
+// type is currently considered experimental and is not yet tied to a
 // tailcfg.CapabilityVersion.
 type BindUDPRelayEndpoint struct {
+	BindUDPRelayEndpointCommon
 }
 
 func (m *BindUDPRelayEndpoint) AppendMarshal(b []byte) []byte {
-	ret, _ := appendMsgHeader(b, TypeBindUDPRelayEndpoint, v0, bindUDPRelayEndpointLen)
+	ret, d := appendMsgHeader(b, TypeBindUDPRelayEndpoint, v0, bindUDPRelayEndpointCommonLen)
+	m.BindUDPRelayEndpointCommon.encode(d)
 	return ret
 }
 
 func parseBindUDPRelayEndpoint(ver uint8, p []byte) (m *BindUDPRelayEndpoint, err error) {
 	m = new(BindUDPRelayEndpoint)
+	err = m.BindUDPRelayEndpointCommon.decode(p)
+	if err != nil {
+		return nil, err
+	}
 	return m, nil
 }
-
-// BindUDPRelayEndpointChallengeLen is the length of a marshalled
-// BindUDPRelayEndpointChallenge message, without the message header.
-const BindUDPRelayEndpointChallengeLen = 32
 
 // BindUDPRelayEndpointChallenge is transmitted from UDP relay server towards
 // UDP relay client in response to a BindUDPRelayEndpoint message as part of the
 // 3-way bind handshake. This message type is currently considered experimental
 // and is not yet tied to a tailcfg.CapabilityVersion.
 type BindUDPRelayEndpointChallenge struct {
-	Challenge [BindUDPRelayEndpointChallengeLen]byte
+	BindUDPRelayEndpointCommon
 }
 
 func (m *BindUDPRelayEndpointChallenge) AppendMarshal(b []byte) []byte {
-	ret, d := appendMsgHeader(b, TypeBindUDPRelayEndpointChallenge, v0, BindUDPRelayEndpointChallengeLen)
-	copy(d, m.Challenge[:])
+	ret, d := appendMsgHeader(b, TypeBindUDPRelayEndpointChallenge, v0, bindUDPRelayEndpointCommonLen)
+	m.BindUDPRelayEndpointCommon.encode(d)
 	return ret
 }
 
 func parseBindUDPRelayEndpointChallenge(ver uint8, p []byte) (m *BindUDPRelayEndpointChallenge, err error) {
-	if len(p) < BindUDPRelayEndpointChallengeLen {
-		return nil, errShort
-	}
 	m = new(BindUDPRelayEndpointChallenge)
-	copy(m.Challenge[:], p[:])
+	err = m.BindUDPRelayEndpointCommon.decode(p)
+	if err != nil {
+		return nil, err
+	}
 	return m, nil
 }
-
-// bindUDPRelayEndpointAnswerLen is the length of a marshalled
-// BindUDPRelayEndpointAnswer message, without the message header.
-const bindUDPRelayEndpointAnswerLen = BindUDPRelayEndpointChallengeLen
 
 // BindUDPRelayEndpointAnswer is transmitted from UDP relay client to UDP relay
 // server in response to a BindUDPRelayEndpointChallenge message. This message
 // type is currently considered experimental and is not yet tied to a
 // tailcfg.CapabilityVersion.
 type BindUDPRelayEndpointAnswer struct {
-	Answer [bindUDPRelayEndpointAnswerLen]byte
+	BindUDPRelayEndpointCommon
 }
 
 func (m *BindUDPRelayEndpointAnswer) AppendMarshal(b []byte) []byte {
-	ret, d := appendMsgHeader(b, TypeBindUDPRelayEndpointAnswer, v0, bindUDPRelayEndpointAnswerLen)
-	copy(d, m.Answer[:])
+	ret, d := appendMsgHeader(b, TypeBindUDPRelayEndpointAnswer, v0, bindUDPRelayEndpointCommonLen)
+	m.BindUDPRelayEndpointCommon.encode(d)
 	return ret
 }
 
 func parseBindUDPRelayEndpointAnswer(ver uint8, p []byte) (m *BindUDPRelayEndpointAnswer, err error) {
-	if len(p) < bindUDPRelayEndpointAnswerLen {
-		return nil, errShort
-	}
 	m = new(BindUDPRelayEndpointAnswer)
-	copy(m.Answer[:], p[:])
+	err = m.BindUDPRelayEndpointCommon.decode(p)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// CallMeMaybeVia is a message sent only over DERP to request that the recipient
+// try to open up a magicsock path back to the sender. The 'Via' in
+// CallMeMaybeVia highlights that candidate paths are served through an
+// intermediate relay, likely a [tailscale.com/net/udprelay.Server].
+//
+// Usage of the candidate paths in magicsock requires a 3-way handshake
+// involving [BindUDPRelayEndpoint], [BindUDPRelayEndpointChallenge], and
+// [BindUDPRelayEndpointAnswer].
+//
+// CallMeMaybeVia mirrors [tailscale.com/net/udprelay/endpoint.ServerEndpoint],
+// which contains field documentation.
+//
+// The recipient may choose to not open a path back if it's already happy with
+// its path. Direct connections, e.g. [CallMeMaybe]-signaled, take priority over
+// CallMeMaybeVia paths.
+//
+// This message type is currently considered experimental and is not yet tied to
+// a [tailscale.com/tailcfg.CapabilityVersion].
+type CallMeMaybeVia struct {
+	// ServerDisco is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.ServerDisco]
+	ServerDisco key.DiscoPublic
+	// LamportID is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.LamportID]
+	LamportID uint64
+	// VNI is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.VNI]
+	VNI uint32
+	// BindLifetime is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.BindLifetime]
+	BindLifetime time.Duration
+	// SteadyStateLifetime is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.SteadyStateLifetime]
+	SteadyStateLifetime time.Duration
+	// AddrPorts is [tailscale.com/net/udprelay/endpoint.ServerEndpoint.AddrPorts]
+	AddrPorts []netip.AddrPort
+}
+
+const cmmvDataLenMinusEndpoints = key.DiscoPublicRawLen + // ServerDisco
+	8 + // LamportID
+	4 + // VNI
+	8 + // BindLifetime
+	8 // SteadyStateLifetime
+
+func (m *CallMeMaybeVia) AppendMarshal(b []byte) []byte {
+	endpointsLen := epLength * len(m.AddrPorts)
+	ret, p := appendMsgHeader(b, TypeCallMeMaybeVia, v0, cmmvDataLenMinusEndpoints+endpointsLen)
+	disco := m.ServerDisco.AppendTo(nil)
+	copy(p, disco)
+	p = p[key.DiscoPublicRawLen:]
+	binary.BigEndian.PutUint64(p[:8], m.LamportID)
+	p = p[8:]
+	binary.BigEndian.PutUint32(p[:4], m.VNI)
+	p = p[4:]
+	binary.BigEndian.PutUint64(p[:8], uint64(m.BindLifetime))
+	p = p[8:]
+	binary.BigEndian.PutUint64(p[:8], uint64(m.SteadyStateLifetime))
+	p = p[8:]
+	for _, ipp := range m.AddrPorts {
+		a := ipp.Addr().As16()
+		copy(p, a[:])
+		binary.BigEndian.PutUint16(p[16:18], ipp.Port())
+		p = p[epLength:]
+	}
+	return ret
+}
+
+func parseCallMeMaybeVia(ver uint8, p []byte) (m *CallMeMaybeVia, err error) {
+	m = new(CallMeMaybeVia)
+	if len(p) < cmmvDataLenMinusEndpoints+epLength ||
+		(len(p)-cmmvDataLenMinusEndpoints)%epLength != 0 ||
+		ver != 0 {
+		return m, nil
+	}
+	m.ServerDisco = key.DiscoPublicFromRaw32(mem.B(p[:key.DiscoPublicRawLen]))
+	p = p[key.DiscoPublicRawLen:]
+	m.LamportID = binary.BigEndian.Uint64(p[:8])
+	p = p[8:]
+	m.VNI = binary.BigEndian.Uint32(p[:4])
+	p = p[4:]
+	m.BindLifetime = time.Duration(binary.BigEndian.Uint64(p[:8]))
+	p = p[8:]
+	m.SteadyStateLifetime = time.Duration(binary.BigEndian.Uint64(p[:8]))
+	p = p[8:]
+	m.AddrPorts = make([]netip.AddrPort, 0, len(p)-cmmvDataLenMinusEndpoints/epLength)
+	for len(p) > 0 {
+		var a [16]byte
+		copy(a[:], p)
+		m.AddrPorts = append(m.AddrPorts, netip.AddrPortFrom(
+			netip.AddrFrom16(a).Unmap(),
+			binary.BigEndian.Uint16(p[16:18])))
+		p = p[epLength:]
+	}
 	return m, nil
 }

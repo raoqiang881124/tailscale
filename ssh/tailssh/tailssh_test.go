@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -48,7 +47,6 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
-	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/ptr"
@@ -230,7 +228,7 @@ func TestMatchRule(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &conn{
 				info: tt.ci,
-				srv:  &server{logf: t.Logf},
+				srv:  &server{logf: tstest.WhileTestRunningLogger(t)},
 			}
 			got, gotUser, gotAcceptEnv, err := c.matchRule(tt.rule)
 			if err != tt.wantErr {
@@ -255,7 +253,7 @@ func TestEvalSSHPolicy(t *testing.T) {
 		name          string
 		policy        *tailcfg.SSHPolicy
 		ci            *sshConnInfo
-		wantMatch     bool
+		wantResult    evalResult
 		wantUser      string
 		wantAcceptEnv []string
 	}{
@@ -301,10 +299,20 @@ func TestEvalSSHPolicy(t *testing.T) {
 			ci:            &sshConnInfo{sshUser: "alice"},
 			wantUser:      "thealice",
 			wantAcceptEnv: []string{"EXAMPLE", "?_?", "TEST_*"},
-			wantMatch:     true,
+			wantResult:    accepted,
 		},
 		{
-			name: "no-matches-returns-failure",
+			name: "no-matches-returns-rejected",
+			policy: &tailcfg.SSHPolicy{
+				Rules: []*tailcfg.SSHRule{},
+			},
+			ci:            &sshConnInfo{sshUser: "alice"},
+			wantUser:      "",
+			wantAcceptEnv: nil,
+			wantResult:    rejected,
+		},
+		{
+			name: "no-user-matches-returns-rejected-user",
 			policy: &tailcfg.SSHPolicy{
 				Rules: []*tailcfg.SSHRule{
 					{
@@ -342,23 +350,23 @@ func TestEvalSSHPolicy(t *testing.T) {
 			ci:            &sshConnInfo{sshUser: "alice"},
 			wantUser:      "",
 			wantAcceptEnv: nil,
-			wantMatch:     false,
+			wantResult:    rejectedUser,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &conn{
 				info: tt.ci,
-				srv:  &server{logf: t.Logf},
+				srv:  &server{logf: tstest.WhileTestRunningLogger(t)},
 			}
-			got, gotUser, gotAcceptEnv, match := c.evalSSHPolicy(tt.policy)
-			if match != tt.wantMatch {
-				t.Errorf("match = %v; want %v", match, tt.wantMatch)
+			got, gotUser, gotAcceptEnv, result := c.evalSSHPolicy(tt.policy)
+			if result != tt.wantResult {
+				t.Errorf("result = %v; want %v", result, tt.wantResult)
 			}
 			if gotUser != tt.wantUser {
 				t.Errorf("user = %q; want %q", gotUser, tt.wantUser)
 			}
-			if tt.wantMatch == true && got == nil {
+			if tt.wantResult == accepted && got == nil {
 				t.Errorf("expected non-nil action on success")
 			}
 			if !slices.Equal(gotAcceptEnv, tt.wantAcceptEnv) {
@@ -469,7 +477,7 @@ func (ts *localState) NodeKey() key.NodePublic {
 func newSSHRule(action *tailcfg.SSHAction) *tailcfg.SSHRule {
 	return &tailcfg.SSHRule{
 		SSHUsers: map[string]string{
-			"*": currentUser,
+			"alice": currentUser,
 		},
 		Action: action,
 		Principals: []*tailcfg.SSHPrincipal{
@@ -491,7 +499,7 @@ func TestSSHRecordingCancelsSessionsOnUploadFailure(t *testing.T) {
 	})
 
 	s := &server{
-		logf: t.Logf,
+		logf: tstest.WhileTestRunningLogger(t),
 		lb: &localState{
 			sshEnabled: true,
 			matchingRule: newSSHRule(
@@ -553,7 +561,7 @@ func TestSSHRecordingCancelsSessionsOnUploadFailure(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s.logf = t.Logf
+			s.logf = tstest.WhileTestRunningLogger(t)
 			tstest.Replace(t, &handler, tt.handler)
 			sc, dc := memnet.NewTCPConn(src, dst, 1024)
 			var wg sync.WaitGroup
@@ -621,7 +629,7 @@ func TestMultipleRecorders(t *testing.T) {
 	})
 
 	s := &server{
-		logf: t.Logf,
+		logf: tstest.WhileTestRunningLogger(t),
 		lb: &localState{
 			sshEnabled: true,
 			matchingRule: newSSHRule(
@@ -714,7 +722,7 @@ func TestSSHRecordingNonInteractive(t *testing.T) {
 	})
 
 	s := &server{
-		logf: t.Logf,
+		logf: tstest.WhileTestRunningLogger(t),
 		lb: &localState{
 			sshEnabled: true,
 			matchingRule: newSSHRule(
@@ -791,6 +799,11 @@ func TestSSHAuthFlow(t *testing.T) {
 		Accept:  true,
 		Message: "Welcome to Tailscale SSH!",
 	})
+	bobRule := newSSHRule(&tailcfg.SSHAction{
+		Accept:  true,
+		Message: "Welcome to Tailscale SSH!",
+	})
+	bobRule.SSHUsers = map[string]string{"bob": "bob"}
 	rejectRule := newSSHRule(&tailcfg.SSHAction{
 		Reject:  true,
 		Message: "Go Away!",
@@ -810,7 +823,16 @@ func TestSSHAuthFlow(t *testing.T) {
 				sshEnabled: true,
 			},
 			authErr:     true,
-			wantBanners: []string{"tailscale: failed to evaluate SSH policy"},
+			wantBanners: []string{"tailscale: tailnet policy does not permit you to SSH to this node\n"},
+		},
+		{
+			name: "user-mismatch",
+			state: &localState{
+				sshEnabled:   true,
+				matchingRule: bobRule,
+			},
+			authErr:     true,
+			wantBanners: []string{`tailscale: tailnet policy does not permit you to SSH as user "alice"` + "\n"},
 		},
 		{
 			name: "accept",
@@ -887,13 +909,15 @@ func TestSSHAuthFlow(t *testing.T) {
 		},
 	}
 	s := &server{
-		logf: log.Printf,
+		logf: tstest.WhileTestRunningLogger(t),
 	}
 	defer s.Shutdown()
 	src, dst := must.Get(netip.ParseAddrPort("100.100.100.101:2231")), must.Get(netip.ParseAddrPort("100.100.100.102:22"))
 	for _, tc := range tests {
 		for _, authMethods := range [][]string{nil, {"publickey", "password"}, {"password", "publickey"}} {
 			t.Run(fmt.Sprintf("%s-skip-none-auth-%v", tc.name, strings.Join(authMethods, "-then-")), func(t *testing.T) {
+				s.logf = tstest.WhileTestRunningLogger(t)
+
 				sc, dc := memnet.NewTCPConn(src, dst, 1024)
 				s.lb = tc.state
 				sshUser := "alice"
@@ -1036,7 +1060,7 @@ func TestSSHAuthFlow(t *testing.T) {
 }
 
 func TestSSH(t *testing.T) {
-	var logf logger.Logf = t.Logf
+	logf := tstest.WhileTestRunningLogger(t)
 	sys := tsd.NewSystem()
 	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker(), sys.UserMetricsRegistry(), sys.Bus.Get())
 	if err != nil {
