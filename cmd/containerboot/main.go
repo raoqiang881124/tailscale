@@ -188,6 +188,14 @@ func run() error {
 		if err := cfg.setupKube(bootCtx, kc); err != nil {
 			return fmt.Errorf("error setting up for running on Kubernetes: %w", err)
 		}
+		// Clear out any state from previous runs of containerboot. Check
+		// hasKubeStateStore because although we know we're in kube, that
+		// doesn't guarantee the state store is properly configured.
+		if hasKubeStateStore(cfg) {
+			if err := kc.resetContainerbootState(bootCtx, cfg.PodUID); err != nil {
+				return fmt.Errorf("error clearing previous state from Secret: %w", err)
+			}
+		}
 	}
 
 	client, daemonProcess, err := startTailscaled(bootCtx, cfg)
@@ -367,11 +375,6 @@ authLoop:
 		if err := client.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
 			return fmt.Errorf("failed to unset serve config: %w", err)
 		}
-		if hasKubeStateStore(cfg) {
-			if err := kc.storeHTTPSEndpoint(ctx, ""); err != nil {
-				return fmt.Errorf("failed to update HTTPS endpoint in tailscale state: %w", err)
-			}
-		}
 	}
 
 	if hasKubeStateStore(cfg) && isTwoStepConfigAuthOnce(cfg) {
@@ -381,12 +384,6 @@ authLoop:
 		log.Printf("Deleting authkey from kube secret")
 		if err := kc.deleteAuthKey(ctx); err != nil {
 			return fmt.Errorf("deleting authkey from kube secret: %w", err)
-		}
-	}
-
-	if hasKubeStateStore(cfg) {
-		if err := kc.storeCapVerUID(ctx, cfg.PodUID); err != nil {
-			return fmt.Errorf("storing capability version and UID: %w", err)
 		}
 	}
 
@@ -441,6 +438,7 @@ authLoop:
 	// egressSvcsErrorChan will get an error sent to it if this containerboot instance is configured to expose 1+
 	// egress services in HA mode and errored.
 	var egressSvcsErrorChan = make(chan error)
+	var ingressSvcsErrorChan = make(chan error)
 	defer t.Stop()
 	// resetTimer resets timer for when to next attempt to resolve the DNS
 	// name for the proxy configured with TS_EXPERIMENTAL_DEST_DNS_NAME. The
@@ -694,6 +692,23 @@ runLoop:
 							}
 						}()
 					}
+					ip := ingressProxy{}
+					if cfg.IngressProxiesCfgPath != "" {
+						log.Printf("configuring ingress proxy using configuration file at %s", cfg.IngressProxiesCfgPath)
+						opts := ingressProxyOpts{
+							cfgPath:     cfg.IngressProxiesCfgPath,
+							nfr:         nfr,
+							kc:          kc,
+							stateSecret: cfg.KubeSecret,
+							podIPv4:     cfg.PodIPv4,
+							podIPv6:     cfg.PodIPv6,
+						}
+						go func() {
+							if err := ip.run(ctx, opts); err != nil {
+								ingressSvcsErrorChan <- err
+							}
+						}()
+					}
 
 					// Wait on tailscaled process. It won't be cleaned up by default when the
 					// container exits as it is not PID1. TODO (irbekrm): perhaps we can replace the
@@ -738,6 +753,8 @@ runLoop:
 			resetTimer(false)
 		case e := <-egressSvcsErrorChan:
 			return fmt.Errorf("egress proxy failed: %v", e)
+		case e := <-ingressSvcsErrorChan:
+			return fmt.Errorf("ingress proxy failed: %v", e)
 		}
 	}
 	wg.Wait()

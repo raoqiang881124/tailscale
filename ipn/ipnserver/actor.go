@@ -144,7 +144,7 @@ func (a *actor) Username() (string, error) {
 		}
 		defer tok.Close()
 		return tok.Username()
-	case "darwin", "linux", "illumos", "solaris":
+	case "darwin", "linux", "illumos", "solaris", "openbsd":
 		uid, ok := a.ci.Creds().UserID()
 		if !ok {
 			return "", errors.New("missing user ID")
@@ -177,6 +177,12 @@ var actorKey = ctxkey.New("ipnserver.actor", actorOrError{err: errNoActor})
 func contextWithActor(ctx context.Context, logf logger.Logf, c net.Conn) context.Context {
 	actor, err := newActor(logf, c)
 	return actorKey.WithValue(ctx, actorOrError{actor: actor, err: err})
+}
+
+// NewContextWithActorForTest returns a new context that carries the identity
+// of the specified actor. It is used in tests only.
+func NewContextWithActorForTest(ctx context.Context, actor ipnauth.Actor) context.Context {
+	return actorKey.WithValue(ctx, actorOrError{actor: actor})
 }
 
 // actorFromContext returns an [ipnauth.Actor] associated with ctx,

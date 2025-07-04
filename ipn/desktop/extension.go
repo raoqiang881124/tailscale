@@ -17,7 +17,6 @@ import (
 	"tailscale.com/feature"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnext"
-	"tailscale.com/tsd"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/syspolicy"
 )
@@ -53,7 +52,7 @@ type desktopSessionsExt struct {
 // newDesktopSessionsExt returns a new [desktopSessionsExt],
 // or an error if a [SessionManager] cannot be created.
 // It is registered with [ipnext.RegisterExtension] if the package is imported.
-func newDesktopSessionsExt(logf logger.Logf, sys *tsd.System) (ipnext.Extension, error) {
+func newDesktopSessionsExt(logf logger.Logf, _ ipnext.SafeBackend) (ipnext.Extension, error) {
 	logf = logger.WithPrefix(logf, featureName+": ")
 	sm, err := NewSessionManager(logf)
 	if err != nil {
@@ -74,13 +73,12 @@ func (e *desktopSessionsExt) Name() string {
 // Init implements [ipnext.Extension].
 func (e *desktopSessionsExt) Init(host ipnext.Host) (err error) {
 	e.host = host
-	unregisterResolver := host.Profiles().RegisterBackgroundProfileResolver(e.getBackgroundProfile)
 	unregisterSessionCb, err := e.sm.RegisterStateCallback(e.updateDesktopSessionState)
 	if err != nil {
-		unregisterResolver()
 		return fmt.Errorf("session callback registration failed: %w", err)
 	}
-	e.cleanup = []func(){unregisterResolver, unregisterSessionCb}
+	host.Hooks().BackgroundProfileResolvers.Add(e.getBackgroundProfile)
+	e.cleanup = []func(){unregisterSessionCb}
 	return nil
 }
 

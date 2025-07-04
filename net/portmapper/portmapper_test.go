@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"tailscale.com/control/controlknobs"
-	"tailscale.com/util/eventbus"
+	"tailscale.com/util/eventbus/eventbustest"
 )
 
 func TestCreateOrGetMapping(t *testing.T) {
@@ -61,7 +61,7 @@ func TestClientProbeThenMap(t *testing.T) {
 }
 
 func TestProbeIntegration(t *testing.T) {
-	igd, err := NewTestIGD(t.Logf, TestIGDOptions{PMP: true, PCP: true, UPnP: true})
+	igd, err := NewTestIGD(t, TestIGDOptions{PMP: true, PCP: true, UPnP: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestProbeIntegration(t *testing.T) {
 }
 
 func TestPCPIntegration(t *testing.T) {
-	igd, err := NewTestIGD(t.Logf, TestIGDOptions{PMP: false, PCP: true, UPnP: false})
+	igd, err := NewTestIGD(t, TestIGDOptions{PMP: false, PCP: true, UPnP: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,27 +137,20 @@ func TestGetUPnPErrorsMetric(t *testing.T) {
 }
 
 func TestUpdateEvent(t *testing.T) {
-	igd, err := NewTestIGD(t.Logf, TestIGDOptions{PCP: true})
+	igd, err := NewTestIGD(t, TestIGDOptions{PCP: true})
 	if err != nil {
 		t.Fatalf("Create test gateway: %v", err)
 	}
 
-	bus := eventbus.New()
-	defer bus.Close()
+	bus := eventbustest.NewBus(t)
+	tw := eventbustest.NewWatcher(t, bus)
 
-	sub := eventbus.Subscribe[Mapping](bus.Client("TestUpdateEvent"))
 	c := newTestClient(t, igd, bus)
 	if _, err := c.Probe(t.Context()); err != nil {
 		t.Fatalf("Probe failed: %v", err)
 	}
 	c.GetCachedMappingOrStartCreatingOne()
-
-	select {
-	case evt := <-sub.Events():
-		t.Logf("Received portmap update: %+v", evt)
-	case <-sub.Done():
-		t.Error("Subscriber closed prematurely")
-	case <-time.After(5 * time.Second):
-		t.Error("Timed out waiting for an update event")
+	if err := eventbustest.Expect(tw, eventbustest.Type[Mapping]()); err != nil {
+		t.Error(err.Error())
 	}
 }

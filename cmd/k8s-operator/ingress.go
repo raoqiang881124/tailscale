@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	"tailscale.com/ipn"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/opt"
@@ -34,6 +35,7 @@ const (
 	tailscaleIngressClassName      = "tailscale"                                   // ingressClass.metadata.name for tailscale IngressClass resource
 	tailscaleIngressControllerName = "tailscale.com/ts-ingress"                    // ingressClass.spec.controllerName for tailscale IngressClass resource
 	ingressClassDefaultAnnotation  = "ingressclass.kubernetes.io/is-default-class" // we do not support this https://kubernetes.io/docs/concepts/services-networking/ingress/#default-ingress-class
+	indexIngressProxyClass         = ".metadata.annotations.ingress-proxy-class"
 )
 
 type IngressReconciler struct {
@@ -218,6 +220,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ChildResourceLabels: crl,
 		ProxyClassName:      proxyClass,
 		proxyType:           proxyTypeIngressResource,
+		LoginServer:         a.ssr.loginServer,
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {

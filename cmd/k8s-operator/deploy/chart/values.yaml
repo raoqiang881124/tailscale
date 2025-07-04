@@ -9,6 +9,9 @@ oauth: {}
   # clientId: ""
   # clientSecret: ""
 
+# URL of the control plane to be used by all resources managed by the operator.
+loginServer: ""
+
 # Secret volume.
 # If set it defines the volume the oauth secrets will be mounted from.
 # The volume needs to contain two files named `client_id` and `client_secret`.

@@ -30,7 +30,6 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
-	_ "tailscale.com/feature/condregister"
 	"tailscale.com/health"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -537,10 +536,7 @@ func (s *Server) start() (reterr error) {
 		if err != nil {
 			return err
 		}
-		s.rootPath, err = getTSNetDir(s.logf, confDir, prog)
-		if err != nil {
-			return err
-		}
+		s.rootPath = filepath.Join(confDir, "tsnet-"+prog)
 	}
 	if err := os.MkdirAll(s.rootPath, 0700); err != nil {
 		return err
@@ -898,49 +894,6 @@ func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(net
 	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
 }
 
-// getTSNetDir usually just returns filepath.Join(confDir, "tsnet-"+prog)
-// with no error.
-//
-// One special case is that it renames old "tslib-" directories to
-// "tsnet-", and that rename might return an error.
-//
-// TODO(bradfitz): remove this maybe 6 months after 2022-03-17,
-// once people (notably Tailscale corp services) have updated.
-func getTSNetDir(logf logger.Logf, confDir, prog string) (string, error) {
-	oldPath := filepath.Join(confDir, "tslib-"+prog)
-	newPath := filepath.Join(confDir, "tsnet-"+prog)
-
-	fi, err := os.Lstat(oldPath)
-	if os.IsNotExist(err) {
-		// Common path.
-		return newPath, nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if !fi.IsDir() {
-		return "", fmt.Errorf("expected old tslib path %q to be a directory; got %v", oldPath, fi.Mode())
-	}
-
-	// At this point, oldPath exists and is a directory. But does
-	// the new path exist?
-
-	fi, err = os.Lstat(newPath)
-	if err == nil && fi.IsDir() {
-		// New path already exists somehow. Ignore the old one and
-		// don't try to migrate it.
-		return newPath, nil
-	}
-	if err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	if err := os.Rename(oldPath, newPath); err != nil {
-		return "", err
-	}
-	logf("renamed old tsnet state storage directory %q to %q", oldPath, newPath)
-	return newPath, nil
-}
-
 // APIClient returns a tailscale.Client that can be used to make authenticated
 // requests to the Tailscale control server.
 // It requires the user to set tailscale.I_Acknowledge_This_API_Is_Unstable.
@@ -1101,13 +1054,33 @@ type FunnelOption interface {
 	funnelOption()
 }
 
-type funnelOnly int
+type funnelOnly struct{}
 
 func (funnelOnly) funnelOption() {}
 
 // FunnelOnly configures the listener to only respond to connections from Tailscale Funnel.
 // The local tailnet will not be able to connect to the listener.
-func FunnelOnly() FunnelOption { return funnelOnly(1) }
+func FunnelOnly() FunnelOption { return funnelOnly{} }
+
+type funnelTLSConfig struct{ conf *tls.Config }
+
+func (f funnelTLSConfig) funnelOption() {}
+
+// FunnelTLSConfig configures the TLS configuration for [Server.ListenFunnel]
+//
+// This is rarely needed but can permit requiring client certificates, specific
+// ciphers suites, etc.
+//
+// The provided conf should at least be able to get a certificate, setting
+// GetCertificate, Certificates or GetConfigForClient appropriately.
+// The most common configuration is to set GetCertificate to
+// Server.LocalClient's GetCertificate method.
+//
+// Unless [FunnelOnly] is also used, the configuration is also used for
+// in-tailnet connections that don't arrive over Funnel.
+func FunnelTLSConfig(conf *tls.Config) FunnelOption {
+	return funnelTLSConfig{conf: conf}
+}
 
 // ListenFunnel announces on the public internet using Tailscale Funnel.
 //
@@ -1138,6 +1111,26 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	port, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
 		return nil, err
+	}
+
+	// Process, validate opts.
+	lnOn := listenOnBoth
+	var tlsConfig *tls.Config
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case funnelTLSConfig:
+			if v.conf == nil {
+				return nil, errors.New("invalid nil FunnelTLSConfig")
+			}
+			tlsConfig = v.conf
+		case funnelOnly:
+			lnOn = listenOnFunnel
+		default:
+			return nil, fmt.Errorf("unknown opts FunnelOption type %T", v)
+		}
+	}
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{GetCertificate: s.getCert}
 	}
 
 	ctx := context.Background()
@@ -1177,19 +1170,11 @@ func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.L
 	}
 
 	// Start a funnel listener.
-	lnOn := listenOnBoth
-	for _, opt := range opts {
-		if _, ok := opt.(funnelOnly); ok {
-			lnOn = listenOnFunnel
-		}
-	}
 	ln, err := s.listen(network, addr, lnOn)
 	if err != nil {
 		return nil, err
 	}
-	return tls.NewListener(ln, &tls.Config{
-		GetCertificate: s.getCert,
-	}), nil
+	return tls.NewListener(ln, tlsConfig), nil
 }
 
 type listenOn string

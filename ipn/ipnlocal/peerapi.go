@@ -36,6 +36,7 @@ import (
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/sockstats"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/netmap"
 	"tailscale.com/types/views"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httpm"
@@ -60,8 +61,6 @@ type peerDNSQueryHandler interface {
 type peerAPIServer struct {
 	b        *LocalBackend
 	resolver peerDNSQueryHandler
-
-	taildrop *taildrop_Manager
 }
 
 func (s *peerAPIServer) listen(ip netip.Addr, ifState *netmon.State) (ln net.Listener, err error) {
@@ -246,6 +245,10 @@ func (h *peerAPIHandler) Logf(format string, a ...any) {
 
 func (h *peerAPIHandler) logf(format string, a ...any) {
 	h.ps.b.logf("peerapi: "+format, a...)
+}
+
+func (h *peerAPIHandler) logfv1(format string, a ...any) {
+	h.ps.b.logf("[v1] peerapi: "+format, a...)
 }
 
 // isAddressValid reports whether addr is a valid destination address for this
@@ -770,7 +773,7 @@ func (h *peerAPIHandler) replyToDNSQueries() bool {
 	// but an app connector explicitly adds 0.0.0.0/32 (and the
 	// IPv6 equivalent) to make this work (see updateFilterLocked
 	// in LocalBackend).
-	f := b.filterAtomic.Load()
+	f := b.currentNode().filter()
 	if f == nil {
 		return false
 	}
@@ -860,7 +863,7 @@ func dohQuery(r *http.Request) (dnsQuery []byte, publicErr string) {
 	case "GET":
 		q64 := r.FormValue("dns")
 		if q64 == "" {
-			return nil, "missing 'dns' parameter"
+			return nil, "missing ‘dns’ parameter; try '?dns=' (DoH standard) or use '?q=<name>' for JSON debug mode"
 		}
 		if base64.RawURLEncoding.DecodedLen(len(q64)) > maxQueryLen {
 			return nil, "query too large"
@@ -1016,6 +1019,7 @@ func (rbw *requestBodyWrapper) Read(b []byte) (int, error) {
 }
 
 func (h *peerAPIHandler) handleServeDrive(w http.ResponseWriter, r *http.Request) {
+	h.logfv1("taildrive: got %s request from %s", r.Method, h.peerNode.Key().ShortString())
 	if !h.ps.b.DriveSharingEnabled() {
 		h.logf("taildrive: not enabled")
 		http.Error(w, "taildrive not enabled", http.StatusNotFound)
@@ -1056,21 +1060,23 @@ func (h *peerAPIHandler) handleServeDrive(w http.ResponseWriter, r *http.Request
 	}
 	r.Body = bw
 
-	if r.Method == httpm.PUT || r.Method == httpm.GET {
-		defer func() {
-			switch wr.statusCode {
-			case 304:
-				// 304s are particularly chatty so skip logging.
-			default:
-				contentType := "unknown"
-				if ct := wr.Header().Get("Content-Type"); ct != "" {
-					contentType = ct
-				}
-
-				h.logf("taildrive: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseDriveFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
+	defer func() {
+		switch wr.statusCode {
+		case 304:
+			// 304s are particularly chatty so skip logging.
+		default:
+			log := h.logf
+			if r.Method != httpm.PUT && r.Method != httpm.GET {
+				log = h.logfv1
 			}
-		}()
-	}
+			contentType := "unknown"
+			if ct := wr.Header().Get("Content-Type"); ct != "" {
+				contentType = ct
+			}
+
+			log("taildrive: share: %s from %s to %s: status-code=%d ext=%q content-type=%q tx=%.f rx=%.f", r.Method, h.peerNode.Key().ShortString(), h.selfNode.Key().ShortString(), wr.statusCode, parseDriveFileExtensionForLog(r.URL.Path), contentType, roundTraffic(wr.contentLength), roundTraffic(bw.bytesRead))
+		}
+	}()
 
 	r.URL.Path = strings.TrimPrefix(r.URL.Path, taildrivePrefix)
 	fs.ServeHTTPWithPerms(p, wr, r)
@@ -1094,6 +1100,48 @@ func parseDriveFileExtensionForLog(path string) string {
 	}
 
 	return fileExt
+}
+
+// peerAPIURL returns an HTTP URL for the peer's peerapi service,
+// without a trailing slash.
+//
+// If ip or port is the zero value then it returns the empty string.
+func peerAPIURL(ip netip.Addr, port uint16) string {
+	if port == 0 || !ip.IsValid() {
+		return ""
+	}
+	return fmt.Sprintf("http://%v", netip.AddrPortFrom(ip, port))
+}
+
+// peerAPIBase returns the "http://ip:port" URL base to reach peer's peerAPI.
+// It returns the empty string if the peer doesn't support the peerapi
+// or there's no matching address family based on the netmap's own addresses.
+func peerAPIBase(nm *netmap.NetworkMap, peer tailcfg.NodeView) string {
+	if nm == nil || !peer.Valid() || !peer.Hostinfo().Valid() {
+		return ""
+	}
+
+	var have4, have6 bool
+	addrs := nm.GetAddresses()
+	for _, a := range addrs.All() {
+		if !a.IsSingleIP() {
+			continue
+		}
+		switch {
+		case a.Addr().Is4():
+			have4 = true
+		case a.Addr().Is6():
+			have6 = true
+		}
+	}
+	p4, p6 := peerAPIPorts(peer)
+	switch {
+	case have4 && p4 != 0:
+		return peerAPIURL(nodeIP(peer, netip.Addr.Is4), p4)
+	case have6 && p6 != 0:
+		return peerAPIURL(nodeIP(peer, netip.Addr.Is6), p6)
+	}
+	return ""
 }
 
 // newFakePeerAPIListener creates a new net.Listener that acts like
